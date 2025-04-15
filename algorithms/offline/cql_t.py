@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
+import algorithms.cw_offline.rl.policy as pl # import TanhGaussianPolicy
+
 TensorBatch = List[torch.Tensor]
 
 
@@ -196,7 +198,7 @@ def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
     env.seed(seed)
-    actor.eval()
+    # actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
         state, done = env.reset(), False
@@ -207,7 +209,7 @@ def eval_actor(
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
-    actor.train()
+    # actor.train()
     return np.asarray(episode_rewards)
 
 
@@ -363,7 +365,6 @@ class TanhGaussianPolicy(nn.Module):
         base_network_output = self.base_network(observations)
         mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
         log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
-        # print("mean:", mean, "std:", log_std)
         actions, log_probs = self.tanh_gaussian(mean, log_std, deterministic)
         return self.max_action * actions, log_probs
 
@@ -572,7 +573,7 @@ class ContinuousCQL:
                 next_log_pi, -1, max_target_indices.unsqueeze(-1)
             ).squeeze(-1)
         else:
-            new_next_actions, next_log_pi = self.actor(next_observations)
+            new_next_actions, next_log_pi = self.actor.sample(next_observations)
             target_q_values = torch.min(
                 self.target_critic_1(next_observations, new_next_actions),
                 self.target_critic_2(next_observations, new_next_actions),
@@ -593,11 +594,12 @@ class ContinuousCQL:
         cql_random_actions = actions.new_empty(
             (batch_size, self.cql_n_actions, action_dim), requires_grad=False
         ).uniform_(-1, 1)
-        cql_current_actions, cql_current_log_pis = self.actor(
-            observations, repeat=self.cql_n_actions
+        extend_observation = self.actor.expend_obs(observations, 1, self.cql_n_actions)
+        cql_current_actions, cql_current_log_pis = self.actor.sample(
+            extend_observation
         )
-        cql_next_actions, cql_next_log_pis = self.actor(
-            next_observations, repeat=self.cql_n_actions
+        cql_next_actions, cql_next_log_pis = self.actor.sample(
+            extend_observation
         )
         cql_current_actions, cql_current_log_pis = (
             cql_current_actions.detach(),
@@ -739,7 +741,8 @@ class ContinuousCQL:
         ) = batch
         self.total_it += 1
 
-        new_actions, log_pi = self.actor(observations)
+        # new_actions, log_pi = self.actor(observations)
+        new_actions, log_pi = self.actor.sample(observations)
 
         alpha, alpha_loss = self._alpha_and_alpha_loss(observations, log_pi)
 
@@ -826,7 +829,7 @@ class ContinuousCQL:
 
 
 @pyrallis.wrap()
-def train(config: TrainConfig):
+def train(config: TrainConfig, cw_config: dict = None) -> None:
     env = gym.make(config.env)
 
     state_dim = env.observation_space.shape[0]
@@ -880,20 +883,54 @@ def train(config: TrainConfig):
         config.orthogonal_init,
         config.q_n_hidden_layers,
     ).to(config.device)
-    critic_2 = FullyConnectedQFunction(state_dim, action_dim, config.orthogonal_init).to(
-        config.device
-    )
+    critic_2 = FullyConnectedQFunction(
+        state_dim,
+        action_dim,
+        config.orthogonal_init,
+    ).to(config.device)
+
     critic_1_optimizer = torch.optim.Adam(list(critic_1.parameters()), config.qf_lr)
     critic_2_optimizer = torch.optim.Adam(list(critic_2.parameters()), config.qf_lr)
 
-    actor = TanhGaussianPolicy(
+    # actor = TanhGaussianPolicy(
+    #     state_dim,
+    #     action_dim,
+    #     max_action,
+    #     log_std_multiplier=config.policy_log_std_multiplier,
+    #     orthogonal_init=config.orthogonal_init,
+    # ).to(config.device)
+
+    policy_kwargs = {
+        "mean_net_args": {
+            "avg_neuron": 256,
+            "num_hidden": 3,
+            "shape": 0.0,
+        },
+        "variance_net_args": {
+            "std_only": True,
+            "contextual": True,
+            "avg_neuron": 256,
+            "num_hidden": 3,
+            "shape": 0.0,
+        },
+        "init_method": "orthogonal",
+        "out_layer_gain": 0.01,
+        "min_std": 1e-5,
+        "act_func_hidden": "leaky_relu",
+        "act_func_last": None,
+    }
+
+    actor = pl.TanhGaussianPolicy(
         state_dim,
         action_dim,
-        max_action,
+        max_action=max_action,
         log_std_multiplier=config.policy_log_std_multiplier,
         orthogonal_init=config.orthogonal_init,
-    ).to(config.device)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
+        device=config.device,
+        **policy_kwargs,
+    )
+
+    actor_optimizer = torch.optim.Adam(actor.parameters, config.policy_lr)
 
     kwargs = {
         "critic_1": critic_1,
@@ -941,7 +978,9 @@ def train(config: TrainConfig):
 
     evaluations = []
     for t in range(int(config.max_timesteps)):
+        # print("time_step", t)
         batch = replay_buffer.sample(config.batch_size)
+        # print(batch[0].size())
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
         # wandb.log(log_dict, step=trainer.total_it)

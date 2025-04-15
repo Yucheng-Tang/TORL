@@ -1,0 +1,104 @@
+exp_name: &exp_name "cw_cql"
+exp_path: &exp_path "../../CORL_exp_result"
+sub_exp_name: &sub_exp_name "test, test"
+act_func_hidden: &act_func_hidden leaky_relu
+act_func_last: &act_func_last null
+dtype: &dtype "float32"
+device: &device "cuda"
+seed: auto
+env: "halfcheetah-medium-expert-v2"
+
+# cw2 config
+name: *exp_name
+path: *exp_path
+verbose_level: 2
+
+# wandb
+wandb:
+  project: *exp_name
+  group: *sub_exp_name
+  entity: CORL
+  log_interval: &log_interval 100
+  log_model: true
+  model_name: model
+
+# experiment parameters
+params:
+  agent:
+    type: StepQAgent
+    # type: SeqQAgent
+    args:
+      lr_policy: 3e-4
+      lr_critic: 5e-5
+      wd_policy: 1e-5
+      wd_critic: 1e-5
+      use_mix_precision: true
+      schedule_lr_policy: false
+      schedule_lr_critic: false
+      clip_critic: 0.0
+      clip_grad_norm: 0.0
+      entropy_penalty_coef: 0.0
+      discount_factor: 1
+      epochs_policy: 15
+      epochs_critic: 30
+      clip_advantages: 0.0
+      set_variance: false
+      balance_check: *log_interval
+      evaluation_interval: *log_interval
+      return_type: segment_n_step_return_vf
+      #      return_type: segment_n_step_return_qf
+      random_target: true
+      num_samples_in_targets: 1
+      use_old_policy: true  # use a target policy as the old policy for the trust region projection
+      old_policy_update_rate: 0.005  # update rate for the old policy from the current policy
+      type_policy_q_update: mean_of_segment_mini_sum_of_actions
+      batch_size: &batch_size 512
+      critic_update_from: 300
+      policy_update_from: 2000
+      segments_config: &segments_config
+        num_segments: random  # 25
+      dtype: *dtype
+      device: *device
+
+  policy:
+    type: TanhGaussianPolicy
+    args:
+      mean_net_args:
+        avg_neuron: 256
+        num_hidden: 3
+        shape: 0.0
+      variance_net_args:
+        std_only: false
+        contextual: true # changed for CQL
+      init_method: orthogonal
+      out_layer_gain: 0.01
+      min_std: 1e-5
+      act_func_hidden: *act_func_hidden
+      act_func_last: *act_func_last
+      dtype: *dtype
+      device: *device
+      orthogonal_init: true
+      policy_log_std_multiplier: 1.0
+
+  critic:
+    type: CQLCritic
+    args:
+      bias: true
+      n_embd: 128
+      block_size: 1024
+      dropout: 0.0
+      n_layer: 2
+      n_head: 8
+      update_rate: 0.005
+      use_layer_norm: true
+      relative_pos: false # false for abs pos encoding, true for relative pos encoding
+      single_q: true
+      dtype: *dtype
+      device: *device
+
+  replay_buffer:
+    type: SeqReplayBuffer
+    args:
+      buffer_size: 5000  # Trajectories
+      device: *device
+      dtype: *dtype
