@@ -171,7 +171,7 @@ def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
     if env is not None:
-        env.seed(seed)
+        env.reset(seed=seed)
         env.action_space.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -195,7 +195,7 @@ def wandb_init(config: dict) -> None:
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):

@@ -97,7 +97,6 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
                                      dim_in=state_dim,
                                      dim_out=action_dim,  # policy_out_dim,
                                      max_action=max_action,
-
                                      **cfg["policy"]["args"])
 
         self.critic = critic_factory(cfg["critic"]["type"],

@@ -1,5 +1,6 @@
 from typing import Literal
 from .seq_replay_buffer import *
+from .step_replay_buffer import *
 
 
 def replay_buffer_factory(typ: Literal["DRPReplayBuffer", "ReplayBuffer"],

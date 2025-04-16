@@ -12,6 +12,7 @@ class FullyConnectedQFunction(nn.Module):
         observation_dim: int,
         action_dim: int,
         hidden_layers: list = [256, 256, 256],
+        net_args: dict = None,
         act_func_hidden: str = "relu",
         act_func_last: str = None,
         init_method: str = "orthogonal",
@@ -19,22 +20,30 @@ class FullyConnectedQFunction(nn.Module):
         dtype: torch.dtype = torch.float32,
         device: torch.device = torch.device("cpu"),
         name: str = "q_func",
+        **config_kwargs,
     ):
         super().__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
+        self.net_args = net_args if net_args else {}
+        self.dtype, self.device = util.parse_dtype_device(dtype, device)
+
+
+        # TODO: generalize net hidden layers
 
         self.net = util.MLP(
             name=name,
             dim_in=observation_dim + action_dim,
             dim_out=1,
             hidden_layers=hidden_layers,
+            # hidden_layers=util.mlp_arch_3_params(
+            #                     **self.net_args),
             act_func_hidden=act_func_hidden,
             act_func_last=act_func_last,
             init_method=init_method,
             out_layer_gain=out_layer_gain,
-            dtype=dtype,
-            device=device,
+            dtype=self.dtype,
+            device=self.device,
         )
 
     def forward(self, observations: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
