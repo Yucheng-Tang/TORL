@@ -225,7 +225,7 @@ class CQLCritic(RegularizedQCritic):
         # q2_rand = self.net2(observations, random_actions)
         q_curr_actions = critic_net(observations, sampled_curr_actions)
         # q2_curr_actions = self.net2(observations, sampled_curr_actions)
-        q_next_actions = critic_net(observations, sampled_next_actions)
+        q_next_actions = critic_net(next_observations, sampled_next_actions)
         # q2_next_actions = self.net2(observations, sampled_next_actions)
         # TODO: check if this is correct. next_observations or observations?
 

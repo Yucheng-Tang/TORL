@@ -860,7 +860,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
     set_seed(seed, env)
 
     critic_config = {
-        "observation_dim": state_dim,
+        "state_dim": state_dim,
         "action_dim": action_dim,
         "single_q": False,
         "device": config.device,
@@ -994,8 +994,9 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         # batch = replay_buffer.sample(config.batch_size)
         batch = replay_buffer_modular.sample(config.batch_size, normalize=True)
         batch = convert_batch_dict_to_list(batch)
-        # print(batch[0].size())
         batch = [b.to(config.device) for b in batch]
+        # print(batch[0].size())
+
         log_dict = trainer.train(batch)
         # wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode

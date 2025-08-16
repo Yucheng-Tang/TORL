@@ -9,7 +9,7 @@ import algorithms.cw_offline.util as util
 class FullyConnectedQFunction(nn.Module):
     def __init__(
         self,
-        observation_dim: int,
+        state_dim: int,
         action_dim: int,
         hidden_layers: list = [256, 256, 256],
         net_args: dict = None,
@@ -23,7 +23,7 @@ class FullyConnectedQFunction(nn.Module):
         **config_kwargs,
     ):
         super().__init__()
-        self.observation_dim = observation_dim
+        self.observation_dim = state_dim
         self.action_dim = action_dim
         self.net_args = net_args if net_args else {}
         self.dtype, self.device = util.parse_dtype_device(dtype, device)
@@ -33,7 +33,7 @@ class FullyConnectedQFunction(nn.Module):
 
         self.net = util.MLP(
             name=name,
-            dim_in=observation_dim + action_dim,
+            dim_in=state_dim + action_dim,
             dim_out=1,
             hidden_layers=hidden_layers,
             # hidden_layers=util.mlp_arch_3_params(

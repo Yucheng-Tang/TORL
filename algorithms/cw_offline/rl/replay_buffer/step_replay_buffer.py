@@ -131,6 +131,28 @@ class StepReplayBuffer:
         if n > self.buffer_size:
             raise ValueError("Replay buffer is smaller than the dataset")
 
+        # obs_0 = data["observations"][:, 0][:1000]
+        # act_0 = data["actions"][:, 0][:1000]
+        #
+        # import matplotlib.pyplot as plt
+        # # Plotting
+        # plt.figure(figsize=(10, 4))
+        #
+        # plt.subplot(1, 2, 1)
+        # plt.plot(obs_0)
+        # plt.title("Observation[0]")
+        # plt.xlabel("Timestep")
+        # plt.ylabel("Value")
+        #
+        # plt.subplot(1, 2, 2)
+        # plt.plot(act_0)
+        # plt.title("Action[0]")
+        # plt.xlabel("Timestep")
+        # plt.ylabel("Value")
+        #
+        # plt.tight_layout()
+        # plt.show()
+
         torch_data = {}
         for name, shape in self.data_info.items():
             np_array = data[name]
@@ -142,6 +164,8 @@ class StepReplayBuffer:
             # Set dtype dynamically based on content
             if "done" in name or "dones" in name or "terminals" in name:
                 dtype = torch.bool
+                done_count = np_array.sum().item()
+                print(f"Number of done transitions (terminal states): {done_count}")
             elif "idx" in name or "index" in name:
                 dtype = torch.long
             else:

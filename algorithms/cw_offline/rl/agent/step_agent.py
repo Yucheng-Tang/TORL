@@ -127,7 +127,7 @@ class StepQAgent(AbstractAgent):
 
         # If logging data in the current step
         self.log_now = self.evaluation_interval == 1 or \
-                       self.num_iterations % self.evaluation_interval == 1
+                       self.num_iterations % self.evaluation_interval == 0
         update_critic_now = self.num_iterations >= self.critic_update_from
         update_policy_now = self.num_iterations >= self.policy_update_from
 
@@ -178,14 +178,14 @@ class StepQAgent(AbstractAgent):
 
         # Log data
         if self.log_now and buffer_is_ready:
-            # Generate statistics for environment rollouts
-            dataset_stats = \
-                util.generate_many_stats(dataset, "exploration", to_np=True,
-                                         exception_keys=["decision_idx"])
+            # # Generate statistics for environment rollouts
+            # dataset_stats = \
+            #     util.generate_many_stats(dataset, "exploration", to_np=True,
+            #                              exception_keys=["decision_idx"])
 
             # Prepare result metrics
             result_metrics = {
-                **dataset_stats,
+                # **dataset_stats,
                 "sampling_time": sampling_time,
                 "process_dataset_time": process_dataset_time,
                 "num_global_steps": self.num_global_steps,
@@ -919,263 +919,102 @@ class StepQAgent(AbstractAgent):
                 self.batch_size, normalize=self.norm_data,
                 use_priority=self.replay_buffer.has_priority,
                 policy_recent=False)
-            states = dataset["step_states"]
-            actions = dataset["step_actions"]
-            num_traj = states.shape[0]
-            traj_length = states.shape[1]
 
-            # Note: Use N-step Q-func return for segment-wise update
-            if self.return_type == "segment_n_step_return_qf":
-                idx_in_segments = self.get_segments(pad_additional=True)
-                seg_start_idx = idx_in_segments[..., 0]
-                assert seg_start_idx[-1] < self.traj_length
-                seg_actions_idx = idx_in_segments[..., :-1]
-                num_seg_actions = seg_actions_idx.shape[-1]
+            observations = dataset["step_states"][:, 0]
+            actions = dataset["step_actions"][:, 0]
+            next_observations = dataset["step_next_states"][:, 0]
+            rewards = dataset["step_rewards"][:, 0]
+            dones = dataset["step_dones"][:, 0]
 
-                # [num_traj, num_segments, dim_state]
-                c_state = states[:, seg_start_idx]
-                seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
+            log_dict = {}
 
-                padded_actions = torch.nn.functional.pad(
-                    actions, (0, 0, 0, num_seg_actions), "constant", 0)
+            # 1. TD loss
+            qf1_loss, qf2_loss, q1_predicted, q2_predicted, td_target, target_q_values = self.critic.td_loss(
+                observations, actions, next_observations, rewards, dones, self.alpha, self.actor
+            )
 
-                # [num_traj, num_segments, num_seg_actions, dim_action]
-                seg_actions = padded_actions[:, seg_actions_idx]
+            # 2. CQL loss
+            conservative_loss_1, std_q1, q1_rand, q1_curr_actions, q1_next_actions = (
+                self.critic.regularization_loss(
+                    observations, next_observations, self.critic.net1, self.actor, q1_predicted
+                ))
+            conservative_loss_2, std_q2, q2_rand, q2_curr_actions, q2_next_actions = (
+                self.critic.regularization_loss(
+                    observations, next_observations, self.critic.net2, self.actor, q2_predicted
+                ))
 
-                # [num_traj, num_segments, num_seg_actions]
-                seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
-                                                      [num_traj])
+            # """Subtract the log likelihood of data"""
+            # cql_qf1_diff = torch.clamp(
+            #     cql_qf1_ood - q1_predicted,
+            #     self.cql_clip_diff_min,
+            #     self.cql_clip_diff_max,
+            # ).mean()
+            # cql_qf2_diff = torch.clamp(
+            #     cql_qf2_ood - q2_predicted,
+            #     self.cql_clip_diff_min,
+            #     self.cql_clip_diff_max,
+            # ).mean()
+            # TODO: check if clamp necessary
 
-                # [num_traj, num_segments, 1 + num_seg_actions]
-                targets = self.segments_n_step_return_qf(dataset, idx_in_segments)
+            # 3. Optional Lagrange version of CQL
+            if self.cql_lagrange:
+                alpha_prime = torch.clamp(
+                    torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0
+                )
+                cql_min_qf1_loss = (
+                        alpha_prime
+                        * self.cql_alpha
+                        * (conservative_loss_1 - self.cql_target_action_gap)
+                )
+                cql_min_qf2_loss = (
+                        alpha_prime
+                        * self.cql_alpha
+                        * (conservative_loss_2 - self.cql_target_action_gap)
+                )
 
-                # Log targets and MC returns
-                # if self.log_now:
-                mc_returns_mean = util.compute_mc_return(
-                    dataset["step_rewards"].mean(dim=0),
-                    self.discount_factor).mean().item()
-
-                mc_returns_list.append(mc_returns_mean)
-                targets_mean = targets.mean().item()
-                targets_list.append(targets_mean)
-                targets_bias_list.append(targets_mean - mc_returns_mean)
-
-                # for net, target_net, opt in self.critic_nets_and_opt():
-                for net, target_net, opt, scaler in self.critic_nets_and_opt():
-
-                    # Use mix precision for faster computation
-                    with autocast_if(self.use_mix_precision):
-                        # [num_traj, num_segments, 1 + num_seg_actions]
-                        vq_pred = self.critic.critic(
-                            net=net, d_state=None, c_state=c_state,
-                            actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
-                            idx_a=seg_actions_idx)  # Exclude v-func at 0th
-
-                        # Mask out the padded actions
-                        # [num_traj, num_segments, num_seg_actions]
-                        valid_mask = seg_actions_idx < self.traj_length
-
-                        # [num_traj, num_segments, num_seg_actions]
-                        vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
-                        targets[..., 1:] = targets[..., 1:] * valid_mask
-
-                        # Loss
-                        critic_loss = mse(vq_pred[..., 1:], targets[..., 1:])  # Q
-
-                    # Update critic net parameters
-                    util.run_time_test(lock=True, key="update critic net")
-                    opt.zero_grad(set_to_none=True)
-
-                    # critic_loss.backward()
-                    scaler.scale(critic_loss).backward()
-
-                    if self.clip_grad_norm > 0 or self.log_now:
-                        grad_norm, grad_norm_c = util.grad_norm_clip(
-                            self.clip_grad_norm, net.parameters())
-                    else:
-                        grad_norm, grad_norm_c = 0., 0.
-
-                    # opt.step()
-                    scaler.step(opt)
-                    scaler.update()
-
-                    update_critic_net_time.append(
-                        util.run_time_test(lock=False,
-                                           key="update critic net"))
-
-                    # Logging
-                    critic_loss_list.append(critic_loss.item())
-                    critic_grad_norm.append(grad_norm)
-                    clipped_critic_grad_norm.append(grad_norm_c)
-
-                    # Update target network
-                    util.run_time_test(lock=True, key="copy critic net")
-                    self.critic.update_target_net(net, target_net)
-                    update_target_net_time.append(
-                        util.run_time_test(lock=False,
-                                           key="copy critic net"))
-
-            # Note: Use N-step V-func return for segment-wise update
-            elif self.return_type == "segment_n_step_return_vf":
-                idx_in_segments = self.get_segments(pad_additional=True)
-                seg_start_idx = idx_in_segments[..., 0]
-                assert seg_start_idx[-1] < self.traj_length
-                seg_actions_idx = idx_in_segments[..., :-1]
-                num_seg_actions = seg_actions_idx.shape[-1]
-
-                # [num_traj, num_segments, dim_state]
-                c_state = states[:, seg_start_idx]
-                seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
-
-                padded_actions = torch.nn.functional.pad(
-                    actions, (0, 0, 0, num_seg_actions), "constant", 0)
-
-                # [num_traj, num_segments, num_seg_actions, dim_action]
-                seg_actions = padded_actions[:, seg_actions_idx]
-
-                # [num_traj, num_segments, num_seg_actions]
-                seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
-                                                      [num_traj])
-
-                # [num_traj, num_segments, 1 + num_seg_actions]
-                targets = self.segments_n_step_return_vf(dataset, idx_in_segments)
-
-                # Log targets and MC returns
-                mc_returns_mean = util.compute_mc_return(
-                    dataset["step_rewards"].mean(dim=0),
-                    self.discount_factor).mean().item()
-
-                mc_returns_list.append(mc_returns_mean)
-                targets_mean = targets.mean().item()
-                targets_list.append(targets_mean)
-                targets_bias_list.append(targets_mean - mc_returns_mean)
-
-                for net, target_net, opt, scaler in self.critic_nets_and_opt():
-                    # Use mix precision for faster computation
-                    with autocast_if(self.use_mix_precision):
-                        # [num_traj, num_segments, 1 + num_seg_actions]
-                        vq_pred = self.critic.critic(
-                            net=net, d_state=None, c_state=c_state,
-                            actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
-                            idx_a=seg_actions_idx)
-
-                        # Mask out the padded actions
-                        # [num_traj, num_segments, num_seg_actions]
-                        valid_mask = seg_actions_idx < self.traj_length
-
-                        # [num_traj, num_segments, num_seg_actions]
-                        vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
-                        targets[..., 1:] = targets[..., 1:] * valid_mask
-
-                        # Loss
-                        critic_loss = mse(vq_pred, targets)  # Both V and Q
-
-                    # Update critic net parameters
-                    util.run_time_test(lock=True, key="update critic net")
-                    opt.zero_grad(set_to_none=True)
-
-                    # critic_loss.backward()
-                    scaler.scale(critic_loss).backward()
-
-                    if self.clip_grad_norm > 0 or self.log_now:
-                        grad_norm, grad_norm_c = util.grad_norm_clip(
-                            self.clip_grad_norm, net.parameters())
-                    else:
-                        grad_norm, grad_norm_c = 0., 0.
-
-                    # opt.step()
-                    scaler.step(opt)
-                    scaler.update()
-
-                    update_critic_net_time.append(
-                        util.run_time_test(lock=False,
-                                           key="update critic net"))
-
-                    # Logging
-                    critic_loss_list.append(critic_loss.item())
-                    critic_grad_norm.append(grad_norm)
-                    clipped_critic_grad_norm.append(grad_norm_c)
-
-                    # Update target network
-                    util.run_time_test(lock=True, key="copy critic net")
-                    self.critic.update_target_net(net, target_net)
-                    update_target_net_time.append(
-                        util.run_time_test(lock=False,
-                                           key="copy critic net"))
-
-            # Note: Use N-step V-func return for segment-wise update
-            elif self.return_type == "v_func":
-                raise NotImplementedError
-
-            # Note: Use true return for update
-            elif self.return_type == "true_return":
-                # Compute targets, [num_traj, traj_length]
-                true_returns = self.compute_true_return(dataset)
-
-                # Update Critics, iteratively backward
-                for state_idx in reversed(range(traj_length)):
-                    c_state = states[:, state_idx]
-                    seg_actions = actions[:, state_idx:]
-                    idx_a = torch.arange(state_idx, traj_length,
-                                         device=self.device)
-                    idx_a = util.add_expand_dim(idx_a, [0], [num_traj])
-                    idx_c = torch.full([num_traj], state_idx,
-                                       device=self.device)
-
-                    # V-func + a sequence of Q-func
-                    for net, target_net, opt, scaler in self.critic_nets_and_opt():
-                        # Use mix precision for faster computation
-                        with autocast_if(self.use_mix_precision):
-                            # [num_traj, num_segments, 1 + num_seg_actions]
-                            q_pred = self.critic.critic(
-                                net=net, d_state=None, c_state=c_state,
-                                actions=seg_actions, idx_d=None, idx_c=idx_c,
-                                idx_a=idx_a)[..., 1:]  # Exclude v-func at 0th
-
-                            targets = true_returns[..., state_idx][..., None]
-                            targets = targets.repeat(1, q_pred.shape[-1])
-
-                            # Loss
-                            critic_loss = mse(q_pred, targets)
-
-                        # Update critic net parameters
-                        util.run_time_test(lock=True, key="update critic net")
-                        opt.zero_grad(set_to_none=True)
-
-                        # critic_loss.backward()
-                        scaler.scale(critic_loss).backward()
-
-                        if self.clip_grad_norm > 0 or self.log_now:
-                            grad_norm, grad_norm_c = util.grad_norm_clip(
-                                self.clip_grad_norm, net.parameters())
-                        else:
-                            grad_norm, grad_norm_c = 0., 0.
-
-                        # opt.step()
-                        scaler.step(opt)
-                        scaler.update()
-
-                        update_critic_net_time.append(
-                            util.run_time_test(lock=False,
-                                               key="update critic net"))
-
-                        # Logging
-                        critic_loss_list.append(critic_loss.item())
-                        critic_grad_norm.append(grad_norm)
-                        clipped_critic_grad_norm.append(grad_norm_c)
-
-                        # Update target network
-                        util.run_time_test(lock=True, key="copy critic net")
-                        self.critic.update_target_net(net, target_net)
-                        update_target_net_time.append(
-                            util.run_time_test(lock=False,
-                                               key="copy critic net"))
-
+                self.alpha_prime_optimizer.zero_grad()
+                alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss) * 0.5
+                alpha_prime_loss.backward(retain_graph=True)
+                self.alpha_prime_optimizer.step()
             else:
-                raise ValueError("Unknown return type")
+                cql_min_qf1_loss = conservative_loss_1 * self.cql_alpha
+                cql_min_qf2_loss = conservative_loss_2 * self.cql_alpha
+                alpha_prime_loss = observations.new_tensor(0.0)
+                alpha_prime = observations.new_tensor(0.0)
 
-        update_critic_time = util.run_time_test(lock=False, key="update critic")
-        self.targets_overestimate = np.mean(targets_bias_list) > 1
+            # 4. Final total Q-function loss
+            qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+
+            # 5. Log values
+            log_dict.update(
+                dict(
+                    qf1_loss=qf1_loss.item(),
+                    qf2_loss=qf2_loss.item(),
+                    alpha=self.alpha.item(),
+                    average_qf1=q1_predicted.mean().item(),
+                    average_qf2=q2_predicted.mean().item(),
+                    average_target_q=target_q_values.mean().item(),
+                )
+            )
+
+            log_dict.update(
+                dict(
+                    cql_std_q1=std_q1.mean().item(),
+                    cql_std_q2=std_q2.mean().item(),
+                    cql_q1_rand=q1_rand.mean().item(),
+                    cql_q2_rand=q2_rand.mean().item(),
+                    cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
+                    cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+                    cql_qf1_diff=conservative_loss_1.mean().item(),
+                    cql_qf2_diff=conservative_loss_2.mean().item(),
+                    cql_q1_current_actions=q1_curr_actions.mean().item(),
+                    cql_q2_current_actions=q2_curr_actions.mean().item(),
+                    cql_q1_next_actions=q1_next_actions.mean().item(),
+                    cql_q2_next_actions=q2_next_actions.mean().item(),
+                    alpha_prime_loss=alpha_prime_loss.item(),
+                    alpha_prime=alpha_prime.item(),
+                )
+            )
 
         # policy update logs
         policy_loss_list = []
@@ -1658,9 +1497,11 @@ class StepQAgent(AbstractAgent):
 
     def save_agent(self, log_dir: str, epoch: int):
         super().save_agent(log_dir, epoch)
-        self.sampler.save_rms(log_dir, epoch)
+        if self.sampler is not None:
+            self.sampler.save_rms(log_dir, epoch)
 
     def load_agent(self, log_dir: str, epoch: int):
         super().load_agent(log_dir, epoch)
-        self.sampler.load_rms(log_dir, epoch)
+        if self.sampler is not None:
+            self.sampler.load_rms(log_dir, epoch)
         self.fresh_agent = False

@@ -22,6 +22,10 @@ import time
 import d4rl
 import gym
 
+# import torch
+# import torch.nn as nn
+# import numpy as np
+
 class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
     def initialize(self,
                    cw_config: dict,
@@ -53,11 +57,11 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
             self.save_model_interval = None
 
         # Load environment and dataset
-        env = gym.make(cw_config["env"])
+        self.env = gym.make(cw_config["env"])
 
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.shape[0]
-        dataset = d4rl.qlearning_dataset(env)
+        state_dim = self.env.observation_space.shape[0]
+        action_dim = self.env.action_space.shape[0]
+        dataset = d4rl.qlearning_dataset(self.env)
 
         # Components
 
@@ -92,7 +96,7 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
         )
 
         # policy_out_dim = self.dim_policy_out(cfg)
-        max_action = float(env.action_space.high[0])
+        max_action = float(self.env.action_space.high[0])
         self.policy = policy_factory(cfg["policy"]["type"],
                                      dim_in=state_dim,
                                      dim_out=action_dim,  # policy_out_dim,
@@ -130,7 +134,50 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
         # self.trainer = ContinuousCQL(...)  # pass your config
         # self.actor = self.trainer.actor
 
+        # Progressbar
+        self.progress_bar = tqdm(total=cw_config["iterations"])
+
+        # Running speed log
+        self.exp_start_time = time.perf_counter()
+
     def iterate(self, cw_config, rep, n):
+        if self.training:
+            result_metrics = self.agent.step()
+            result_metrics["exp_speed"] = self.experiment_speed(n)
+
+            self.progress_bar.update(1)
+            if self.verbose_level == 0:
+                return {}
+            elif self.verbose_level == 1:
+                for key in dict(result_metrics).keys():
+                    if ("exploration" in key
+                            or "projection" in key
+                            or "gradient" in key
+                            or "grad_norm" in key
+                            or "clipped_" in key
+                            or "mc_returns" in key
+                            or "targets_bias" in key
+                            or "step_actions" in key
+                            or "step_states" in key
+                            or "step_rewards" in key
+                            or "step_desired_pos" in key
+                            or "step_desired_vel" in key
+                            or "step_dones" in key
+                            or "time_limit_dones" in key
+                            or "segment" in key
+                            or "update_" in key
+                            or "median" in key
+                            or "targets" in key
+                            or "entropy" in key
+                            or "trust_region" in key
+                            or "loss" in key
+                            or "critic" in key
+                    ):
+                        del result_metrics[key]
+                return result_metrics
+            elif self.verbose_level == 2:
+                return result_metrics
+
         # # Sample batch from the replay buffer
         # batch = self.replay_buffer.sample(self.cfg.batch_size)
         # batch = [b.to(self.cfg.device) for b in batch]
@@ -139,7 +186,7 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
         #
         # self._step += 1
         # if self._step % self.cfg.eval_freq == 0:
-        #     eval_score = eval_actor(
+        #     eval_score = self.eval_actor(
         #         self.env,
         #         self.actor,
         #         device=self.cfg.device,
@@ -152,7 +199,7 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
         #         "eval_score": score,
         #         "d4rl_normalized_score": norm_score
         #     })
-        return {}
+        # return {}
 
     def save_state(self, cw_config: dict, rep: int, n: int) -> None:
         if self.save_model_dir and ((n + 1) % self.save_model_interval == 0
@@ -161,6 +208,30 @@ class CQLCW2Experiment(experiment.AbstractIterativeExperiment):
 
     def finalize(self, *args, **kwargs):
         print("Training complete")
+
+    def experiment_speed(self, n):
+        current_time = time.perf_counter()
+        # Time in seconds per iteration
+        return (current_time - self.exp_start_time) / (n + 1)
+
+    # @torch.no_grad()
+    # def eval_actor(
+    #         env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+    # ) -> np.ndarray:
+    #     env.reset(seed=seed)
+    #     # actor.eval()
+    #     episode_rewards = []
+    #     for _ in range(n_episodes):
+    #         state, done = env.reset(), False
+    #         episode_reward = 0.0
+    #         while not done:
+    #             action = actor.act(state, device)
+    #             state, reward, done, _ = env.step(action)
+    #             episode_reward += reward
+    #         episode_rewards.append(episode_reward)
+    #
+    #     # actor.train()
+    #     return np.asarray(episode_rewards)
 
 
 def main():

@@ -53,8 +53,8 @@ params:
       old_policy_update_rate: 0.005  # update rate for the old policy from the current policy
       type_policy_q_update: mean_of_segment_mini_sum_of_actions
       batch_size: &batch_size 512
-      critic_update_from: 300
-      policy_update_from: 2000
+      critic_update_from: 0 # 300
+      policy_update_from: 0 # 2000
       segments_config: &segments_config
         num_segments: random  # 25
       dtype: *dtype
@@ -70,6 +70,9 @@ params:
       variance_net_args:
         std_only: false
         contextual: true # changed for CQL
+        avg_neuron: 256
+        num_hidden: 3
+        shape: 0.0
       init_method: orthogonal
       out_layer_gain: 0.01
       min_std: 1e-5
@@ -92,7 +95,7 @@ params:
       update_rate: 0.005
       use_layer_norm: true
       relative_pos: false # false for abs pos encoding, true for relative pos encoding
-      single_q: true
+      single_q: false # false for CQL, true for SAC
       dtype: *dtype
       device: *device
 

@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+from typing import Dict
 
 from algorithms.cw_offline import util
 
@@ -63,6 +65,8 @@ class SeqReplayBuffer:
             assert not self.has_priority, \
                 "Policy recent factor not supported with priority"
         self.policy_scope = int(self.buffer_size * policy_scope_factor)
+
+        self.sequence_length = kwargs.get("sequence_length", 100)
 
     @torch.no_grad()
     def add(self, dataset_dict: dict):
@@ -167,14 +171,44 @@ class SeqReplayBuffer:
         else:
             idx = torch.randint(0, self._size, (batch_size,), device=self.device)
         smp_dict = dict()
-        for data_name, data_buffer in self.replay_buffer.items():
-            smp_data = data_buffer[idx]
 
+        terminal_key = next((k for k in self.replay_buffer if "done" in k or "dones" in k or "terminals" in k), None)
+        terminals_tensor = self.replay_buffer[terminal_key] if terminal_key else None
+
+        for data_name, data_buffer in self.replay_buffer.items():
+            is_terminal_tag = data_name == terminal_key
+            d = data_buffer.shape[1:]  # trailing dims
+            seq_list = []
+
+            seq_batch = torch.zeros((batch_size, self.sequence_length, *d), dtype=data_buffer.dtype, device=self.device)
+
+            for b in range(batch_size):
+                start = idx[b].item()
+                end = min(start + self.sequence_length, self._size)
+                valid_len = end - start
+
+                seq_batch[b, :valid_len] = data_buffer[start:end]  # shape: [valid_len, *d]
+
+                if is_terminal_tag and valid_len < self.sequence_length:
+                    seq_batch[b, valid_len:] = True
+
+                if not is_terminal_tag and terminal_key is not None:
+                    done_window = torch.ones(self.sequence_length, dtype=torch.bool, device=self.device)
+                    done_window[:valid_len] = self.replay_buffer[terminal_key][start:end].view(-1)
+
+                    done_indices = (done_window > 0).nonzero(as_tuple=True)[0]
+                    if len(done_indices) > 0:
+                        first_done = done_indices[0].item()
+                        zero_start = first_done + 1
+                        if zero_start < self.sequence_length:
+                            seq_batch[b, zero_start:] = 0
+
+            # smp_data = data_buffer[idx]
             # Norm
             if normalize:
-                smp_data = self.normalize_data(data_name, smp_data)
+                seq_batch = self.normalize_data(data_name, seq_batch)
 
-            smp_dict[data_name] = smp_data
+            smp_dict[data_name] = seq_batch
         return smp_dict
 
     @torch.no_grad()
@@ -212,3 +246,71 @@ class SeqReplayBuffer:
             data_buffer.zero_()
         self._ptr = 0
         self._size = 0
+
+    def load_d4rl_dataset(self, data: Dict[str, np.ndarray]):
+        if self._size != 0:
+            raise ValueError("Trying to load data into non-empty replay buffer")
+
+        reference_key = next(iter(self.data_info))
+        n = data[reference_key].shape[0]
+
+        if n > self.buffer_size:
+            raise ValueError("Replay buffer is smaller than the dataset")
+
+        torch_data = {}
+        for name, shape in self.data_info.items():
+            np_array = data[name]
+
+            # Automatically reshape scalar values
+            if len(shape) == 1 and np_array.ndim == 1:
+                np_array = np_array[..., None]
+
+            # d = np_array.shape[1:]  # trailing shape, e.g., (obs_dim,)
+            # sequences = []
+
+            # for i in range(n):
+            #     # Compute how many valid steps we can take
+            #     remaining = n - i
+            #     window = np.zeros((self.sequence_length, *d), dtype=np_array.dtype)
+            #
+            #     if remaining >= self.sequence_length:
+            #         window[:] = np_array[i:i + self.sequence_length]
+            #     else:
+            #         window[:remaining] = np_array[i:]
+            #
+            #     if "done" in name or "dones" in name or "terminals" in name:
+            #         # Set all out-of-bounds as terminal = True
+            #         if remaining < self.sequence_length:
+            #             window[remaining:] = True
+            #     else:
+            #         # Check if there's a terminal in this window
+            #         done_window = data["terminals"][i:i + self.sequence_length]
+            #         done_flags = np.zeros((self.sequence_length,), dtype=bool)
+            #         done_flags[:remaining] = done_window
+            #
+            #         if done_flags.any():
+            #             first_done = np.argmax(done_flags)
+            #             # Zero out values after the first terminal
+            #             window[first_done + 1:] = 0
+            #
+            #         # Also zero out padded area if any
+            #         if remaining < self.sequence_length:
+            #             window[remaining:] = 0
+            #
+            #     sequences.append(window)
+            #
+            # sequence_data = np.stack(sequences, axis=0)
+
+            # Set dtype dynamically based on content
+            if "done" in name or "dones" in name or "terminals" in name:
+                dtype = torch.bool
+                # done_count = np_array.sum().item()
+                # print(f"Number of done transitions (terminal states): {done_count}")
+            elif "idx" in name or "index" in name:
+                dtype = torch.long
+            else:
+                dtype = torch.float32
+            torch_data[name] = torch.tensor(np_array, dtype=dtype, device=self.device)
+
+        self.add(torch_data)
+        print(f"Dataset size: {n}")

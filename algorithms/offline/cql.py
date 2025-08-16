@@ -26,7 +26,7 @@ class TrainConfig:
     device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
-    eval_freq: int = int(5e3)  # How often (time steps) we evaluate
+    eval_freq: int = int(5e2)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
     checkpoints_path: Optional[str] = None  # Save path
@@ -696,6 +696,8 @@ class ContinuousCQL:
             alpha_prime = observations.new_tensor(0.0)
 
         qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+        # print("QF Loss:", qf1_loss.item(), qf2_loss.item(), cql_min_qf1_loss.item(),
+        #       cql_min_qf2_loss.item())
 
         log_dict.update(
             dict(
