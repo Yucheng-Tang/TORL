@@ -71,16 +71,31 @@ class TanhGaussianPolicy(AbstractGaussianPolicy):
 
         return action_distribution, mean, std
 
-    def sample(self, obs):
+    def sample(self, obs, num_samples: int = 1):
         dist, mean, std = self.policy(obs)
 
         if self.deterministic:
             action = torch.tanh(mean)
+            log_prob = dist.log_prob(action).sum(-1)
         else:
-            action = dist.rsample()
+            action = dist.rsample(torch.Size([num_samples]))  # [K, B, dim_out]
+            log_prob = dist.log_prob(action).sum(-1)  # [K, B]
+
+            # move K to be the second dim: [B, K, ...]
+            if action.ndim == 3:
+                action = action.transpose(0, 1)  # [B, K, dim_out]
+                log_prob = log_prob.transpose(0, 1)  # [B, K]
+            elif action.ndim == 4:
+                action = action.permute(1, 2, 0, 3)  # [B, S, K, dim_out]
+                log_prob = log_prob.permute(1, 2, 0)  # [B, S, K]
+            elif action.ndim == 5:
+                action = action.permute(1, 2, 0, 3, 4)  # [B, S, K, L, dim_out]
+                log_prob = log_prob.permute(1, 2, 0, 3)  # [B, S, K, L]
+            else:
+                raise ValueError(f"Unsupported action shape: {action.shape}")
 
         # action = dist.rsample()  # reparameterization trick
-        log_prob = dist.log_prob(action).sum(-1)
+
         return self.max_action * action, log_prob
 
     def log_prob(self, obs, actions):
