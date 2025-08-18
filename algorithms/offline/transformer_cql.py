@@ -29,6 +29,12 @@ from torch.cuda.amp import GradScaler
 
 from tqdm import tqdm
 
+import os, torch
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+torch.autograd.set_detect_anomaly(True)
+torch.use_deterministic_algorithms(True)
+torch.backends.cudnn.benchmark = False
+
 
 TensorBatch = List[torch.Tensor]
 
@@ -594,7 +600,7 @@ class ContinuousCQL:
 
         self.total_it = 0
 
-        self.progress_bar = tqdm(total=config.max_timesteps)
+        self.progress_bar = tqdm(total=1e6)
 
 
     def get_segments(self, pad_additional=False):
@@ -627,8 +633,10 @@ class ContinuousCQL:
         if num_seg == 1:
             start_idx = 0
         else:
-            start_idx = torch.randint(0, seg_length, [],
-                                      dtype=torch.long, device=self._device)
+            start_idx = 0
+
+            # start_idx = torch.randint(0, seg_length, [],
+            #                           dtype=torch.long, device=self._device)
         
         num_seg_actual = (self.traj_length - start_idx) // seg_length
         if pad_additional:
@@ -1174,31 +1182,26 @@ class ContinuousCQL:
                 """
         states = observations  # [num_traj, traj_length, dim_state]
 
-        # rewards, dones, actions stay the same
-        # rewards = dataset["step_rewards"]
-        # dones = dataset["step_dones"]
-        # decision_idx = dataset["decision_idx"]  # [num_traj]
-        # # [num_traj, traj_length, dim_action]
-        # traj_init_pos = dataset["step_desired_pos"]
-        # traj_init_vel = dataset["step_desired_vel"]
-
         num_segments = idx_in_segments.shape[0]
         num_seg_actions = idx_in_segments.shape[-1] - 1
         seg_start_idx = idx_in_segments[..., 0]
 
-        # TODO: check if the index is correct
-        n_states = next_observations[:, seg_start_idx]  # [num_traj, num_segments, dim_state]
-
         num_traj, traj_length = states.shape[0], states.shape[1]
 
-        # NOTE: additional dimension is defined as [num_traj, num_segments]
-        # TODO: MP actor related part removed, action sampling is also not necessary? use action in the dataset or directly V(s_t+n)?
+        # TODO: check if the index is correct
+        n_idx = torch.arange(traj_length, device=self.device).long()
+        n_idx = util.add_expand_dim(n_idx, [0], [num_traj])
+
+        a_idx = util.add_expand_dim(n_idx, [-1], [1])
+
+        n_states = next_observations[:, seg_start_idx]  # [num_traj, num_segments, dim_state]
+        n_states_seq = next_observations
 
         # [num_traj, num_segments, 1, dim_action] or
         # [num_traj, num_segments, num_smps, 1, dim_action]
         # For step-based actor, only sample action based on the initial state
         with torch.no_grad():
-            n_actions, n_action_log_pi = self.actor.sample(n_states, num_samples=self.num_samples_in_targets)
+            n_actions, n_action_log_pi = self.actor.sample(n_states_seq, num_samples=self.num_samples_in_targets)
 
         # Normalize actions
         if self.norm_data:
@@ -1222,39 +1225,64 @@ class ContinuousCQL:
         # [num_traj, num_segments, dim_state]
         # c_state = states[:, seg_start_idx]
         #
-        if self.num_samples_in_targets == 1:
-            # [num_traj, num_segments]
-            n_idx = util.add_expand_dim(seg_start_idx+1, [0], [num_traj])
+        # sample the first index
+        # if self.num_samples_in_targets == 1:
+        #     # [num_traj, num_segments]
+        #     n_idx = util.add_expand_dim(seg_start_idx+1, [0], [num_traj])
+        #
+        #     # [num_segments, num_seg_actions]
+        #     # -> [num_traj, num_segments, num_seg_actions]
+        #     a_idx = util.add_expand_dim(seg_start_idx+1,
+        #                                 [0, 2], [num_traj, 1])
+        # else:
+        #     num_smp = self.num_samples_in_targets
+        #
+        #     # -> [num_traj, num_segments, num_smp, dim_state]
+        #     n_states = util.add_expand_dim(n_states, [2], [num_smp])
+        #
+        #     # [num_traj, num_segments, num_smp]
+        #     n_idx = util.add_expand_dim(seg_start_idx, [0, 2],
+        #                                 [num_traj, num_smp])
+        #     # [num_segments, num_seg_actions]
+        #     # -> [num_traj, num_segments, num_smp, num_seg_actions]
+        #     a_idx = util.add_expand_dim(seg_start_idx+1,
+        #                                 [0, 2, 3],
+        #                                 [num_traj, num_smp, 1])
 
-            # [num_segments, num_seg_actions]
-            # -> [num_traj, num_segments, num_seg_actions]
-            a_idx = util.add_expand_dim(seg_start_idx+1,
-                                        [0, 2], [num_traj, 1])
-        else:
+        # sample the entire trajectory
+        # if self.num_samples_in_targets == 1:
+        #     # [num_traj, num_segments]
+        #     n_idx = util.add_expand_dim(seg_start_idx+1, [0], [num_traj])
+        #
+        #     # [num_segments, num_seg_actions]
+        #     # -> [num_traj, num_segments, num_seg_actions]
+        #     a_idx = util.add_expand_dim(seg_start_idx+1,
+        #                                 [0, 2], [num_traj, 1])
+        if self.num_samples_in_targets != 1:
             num_smp = self.num_samples_in_targets
 
-            # -> [num_traj, num_segments, num_smp, dim_state]
-            n_states = util.add_expand_dim(n_states, [2], [num_smp])
+            # -> [num_traj, traj_length, num_smp, dim_state]
+            n_states_seq = util.add_expand_dim(n_states_seq, [2], [num_smp])
 
-            # [num_traj, num_segments, num_smp]
-            n_idx = util.add_expand_dim(seg_start_idx, [0, 2],
-                                        [num_traj, num_smp])
+            # [num_traj, traj_length, num_smp]
+            n_idx = util.add_expand_dim(n_idx, [-1],
+                                        [num_smp])
             # [num_segments, num_seg_actions]
-            # -> [num_traj, num_segments, num_smp, num_seg_actions]
-            a_idx = util.add_expand_dim(seg_start_idx+1,
-                                        [0, 2, 3],
-                                        [num_traj, num_smp, 1])
+            # -> [num_traj, traj_length, num_smp, num_seg_actions]
+            a_idx = util.add_expand_dim(a_idx,
+                                        [2],
+                                        [num_smp])
 
         # Use mix precision for faster computation
         with util.autocast_if(self.use_mix_precision):
             # [num_traj, num_segments, (num_smp,) 1 + num_seg_actions]
             future_q1_sampled = self.critic.critic(self.critic.target_net1,
-                                           d_state=None, c_state=n_states,
+                                           d_state=None, c_state=n_states_seq,
                                            actions=n_actions, idx_d=None,
                                            idx_c=n_idx, idx_a=a_idx)
             if not self.critic.single_q:
                 future_q2_sampled = self.critic.critic(self.critic.target_net2,
-                                               d_state=None, c_state=n_states,
+                                               d_state=None, c_state=n_states_seq,
                                                actions=n_actions, idx_d=None,
                                                idx_c=n_idx, idx_a=a_idx)
             else:
@@ -1264,91 +1292,40 @@ class ContinuousCQL:
         if self.random_target:
             # Randomly choose the Q value from Q1 or Q2
             mask = torch.randint(0, 2, future_q1_sampled.shape, device=self.device)
-            future_q_sampled = future_q1_sampled * mask + future_q2_sampled * (1 - mask)
+            min_q1_q2 = future_q1_sampled * mask + future_q2_sampled * (1 - mask)
         else:
-            future_q_sampled = torch.minimum(future_q1_sampled, future_q2_sampled)
+            min_q1_q2 = torch.minimum(future_q1_sampled, future_q2_sampled)
 
         if self.num_samples_in_targets > 1:
-            future_q_sampled = future_q_sampled.mean(dim=-2)
+            min_q1_q2 = min_q1_q2.mean(dim=-2)
 
-        future_q_sampled = future_q_sampled[..., 1].squeeze()
+        # min_q1_q2 = min_q1_q2[..., 1].squeeze()
 
-        # # Use last q as the target of the V-func
-        # # [num_traj, num_segments, 1 + num_seg_actions]
-        # # -> [num_traj, num_segments]
-        # # Tackle the Q-func beyond the length of the trajectory
-        # # Option, Use the last q predictions
-        # future_returns[:, :-1, 0] = future_q[:, :-1, -1]
-        #
-        # # Find the idx where the action is the last action in the valid trajectory
-        # last_valid_q_idx = idx_in_segments[-1] == traj_length
-        # future_returns[:, -1, 0] = (
-        #     future_q[:, -1, last_valid_q_idx].squeeze(-1))
-        #
-        # # Option, Use the average q predictions, exclude the vf at 0th place
-        # # Option does not work well
-        # # future_returns[:, :-1, 0] = future_q[:, :-1, 1:].mean(dim=-1)
-        #
-        # # Find the idx where the action is the last action in the valid trajectory
-        # # last_valid_q_idx = (idx_in_segments[-1] <= traj_length)[1:]
-        # # future_returns[:, -1, 0] = future_q[:, -1, 1:][..., last_valid_q_idx].mean(dim=-1)
-
-        # TODO: check how to get the target of the first column V(s0)
-
-        ##################### Compute the V in the future ######################
-        # state after executing the action
-        # [num_traj, traj_length]
-        c_idx = torch.arange(traj_length, device=self.device).long()
-        c_idx = util.add_expand_dim(c_idx, [0], [num_traj])
-
-        a_idx = util.add_expand_dim(c_idx, [-1], [1])
-
-        # [num_traj, traj_length, dim_state]
-        c_state = states
-        c_action = actions.unsqueeze(-2)
-
-        # Use mix precision for faster computation
-        with util.autocast_if(self.use_mix_precision):
-            # [num_traj, traj_length]
-            future_q1 = self.critic.critic(self.critic.target_net1,
-                                           d_state=None, c_state=c_state,
-                                           actions=c_action, idx_d=None,
-                                           idx_c=c_idx, idx_a=a_idx).squeeze(-1)
-            if not self.critic.single_q:
-                future_q2 = self.critic.critic(self.critic.target_net2,
-                                               d_state=None, c_state=c_state,
-                                               actions=c_action, idx_d=None,
-                                               idx_c=c_idx, idx_a=a_idx).squeeze(-1)
-            else:
-                future_q2 = future_q1
-
-        # if self.random_target and not self.targets_overestimate:
-        if self.random_target:
-            # Randomly choose the V value from V1 or V2
-            mask = torch.randint(0, 2, future_q1.shape, device=self.device)
-            future_q = future_q1 * mask + future_q2 * (1 - mask)
-        else:
-            future_q = torch.minimum(future_q1, future_q2)
-
-        future_q = future_q[..., 1:].squeeze()
+        future_q_sampled = torch.zeros([num_traj, traj_length],
+                               device=self.device)
+        future_q_sampled = min_q1_q2[..., 1].squeeze()
 
         # Pad zeros to the states which go beyond the traj length
         future_q_pad_zero_end \
-            = torch.nn.functional.pad(future_q, (0, num_seg_actions))
+            = torch.nn.functional.pad(future_q_sampled, (0, num_seg_actions))
 
         # [num_segments, num_seg_actions]
-        q_idx = idx_in_segments[:, 2:]
+        q_idx = idx_in_segments[:, :-1]  # since next_states used
         # assert v_idx.max() <= traj_length
 
         # [num_traj, traj_length] -> [num_traj, num_segments, num_seg_actions]
-        future_returns[..., 2:] = future_q_pad_zero_end[:, q_idx]
-
-        future_returns[..., 1] = future_q_sampled
+        future_returns[..., 1:] = future_q_pad_zero_end[:, q_idx]
+        # for test using Q all equal 100
+        # future_returns[future_returns != 0] = 100
 
         ################ Compute the reward in the future ##################
         # [num_traj, traj_length] -> [num_traj, traj_length + padding]
         future_r_pad_zero_end \
             = torch.nn.functional.pad(rewards, (0, num_seg_actions))
+
+        # for test using reward all equal 1
+        # future_r_pad_zero_end \
+        #     = torch.nn.functional.pad(torch.ones_like(rewards), (0, num_seg_actions))
 
         # discount_seq as: [1, gamma, gamma^2..., 0]
         discount_idx \
@@ -1358,7 +1335,9 @@ class ContinuousCQL:
 
         # Apply discount to all rewards and returns w.r.t the traj start
         # [num_traj, num_segments, 1 + traj_length]
-        discount_returns = future_returns * discount_seq[idx_in_segments]
+        # TODO: check if index is set correctly
+        discount_returns = future_returns * discount_seq[idx_in_segments - 1]
+        # discount_returns = future_returns * discount_seq[idx_in_segments]
 
         # [num_traj, traj_length + 1]
         discount_r = future_r_pad_zero_end * discount_seq
@@ -1886,6 +1865,13 @@ class ContinuousCQL:
                 targets_mean = targets.mean().item()
                 targets_list.append(targets_mean)
                 targets_bias_list.append(targets_mean - mc_returns_mean)
+                log_dict.update(
+                    dict(
+                        mc_returns_mean=mc_returns_mean.item(),
+                        targets_mean=targets_mean.item(),
+                        targets_bias_mean=(targets_mean - mc_returns_mean).item(),
+                    )
+                )
 
                 for net, target_net, opt, scaler in self.critic_nets_and_opt():
                     # Use mix precision for faster computation
@@ -2021,6 +2007,14 @@ class ContinuousCQL:
                 targets_mean = targets.mean().item()
                 targets_list.append(targets_mean)
                 targets_bias_list.append(targets_mean - mc_returns_mean)
+
+                log_dict.update(
+                    dict(
+                        mc_returns_mean=mc_returns_mean,
+                        targets_mean=targets_mean,
+                        targets_bias=targets_mean - mc_returns_mean,
+                    )
+                )
 
                 for net, target_net, opt, scaler in self.critic_nets_and_opt():
                     # Use mix precision for faster computation
