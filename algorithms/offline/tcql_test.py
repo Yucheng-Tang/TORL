@@ -15,8 +15,6 @@ import pyrallis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from d4rl.kitchen.adept_envs.franka.robot.franka_robot import observation
-
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
 
@@ -46,7 +44,7 @@ class TrainConfig:
     device: str = "cuda:1"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
-    eval_freq: int = 1 # int(5e2)  # How often (time steps) we evaluate
+    eval_freq: int = int(5e2)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
     checkpoints_path: Optional[str] = None  # Save path
@@ -79,8 +77,8 @@ class TrainConfig:
     reward_bias: float = -1.0  # Reward bias for normalization
     policy_log_std_multiplier: float = 1.0  # Stochastic policy std multiplier
     project: str = "TORL"  # wandb project name
-    group: str = "TCQL-D4RL"  # wandb group name
-    name: str = "TCQL_normalized_rand"  # wandb run name
+    group: str = "CQL-D4RL"  # wandb group name
+    name: str = "CQL_ac"  # wandb run name
 
     # New parameters for segment-based critic update
     use_segment_critic_update: bool = False  # Use segment-based critic update
@@ -224,46 +222,46 @@ def wandb_init(config: dict) -> None:
     wandb.run.save()
 
 
-@torch.no_grad()
-def eval_actor(
-        env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
-    env.reset(seed=seed)
-    # actor.eval()
-    episode_rewards = []
-    for _ in range(n_episodes):
-        state, done = env.reset(), False
-        episode_reward = 0.0
-        while not done:
-            action = actor.act(state, device)
-            # action = actor.sample(state)
-            # print("action", action)
-            state, reward, done, _ = env.step(action)
-            episode_reward += reward
-            # print("reward", reward)
-        episode_rewards.append(episode_reward)
-
-    # actor.train()
-    return np.asarray(episode_rewards)
-
 # @torch.no_grad()
 # def eval_actor(
-#     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+#         env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 # ) -> np.ndarray:
 #     env.reset(seed=seed)
-#     actor.eval()
+#     # actor.eval()
 #     episode_rewards = []
 #     for _ in range(n_episodes):
 #         state, done = env.reset(), False
 #         episode_reward = 0.0
 #         while not done:
 #             action = actor.act(state, device)
+#             # action = actor.sample(state)
+#             # print("action", action)
 #             state, reward, done, _ = env.step(action)
 #             episode_reward += reward
+#             # print("reward", reward)
 #         episode_rewards.append(episode_reward)
 #
-#     actor.train()
+#     # actor.train()
 #     return np.asarray(episode_rewards)
+
+@torch.no_grad()
+def eval_actor(
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+) -> np.ndarray:
+    env.reset(seed=seed)
+    actor.eval()
+    episode_rewards = []
+    for _ in range(n_episodes):
+        state, done = env.reset(), False
+        episode_reward = 0.0
+        while not done:
+            action = actor.act(state, device)
+            state, reward, done, _ = env.step(action)
+            episode_reward += reward
+        episode_rewards.append(episode_reward)
+
+    actor.train()
+    return np.asarray(episode_rewards)
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -483,13 +481,13 @@ class Scalar(nn.Module):
 class ContinuousCQL:
     def __init__(
             self,
-            # critic_1,
-            # # target_critic_1,
-            # critic_1_optimizer,
-            # critic_2,
-            # # target_critic_2,
-            # critic_2_optimizer,
-            critic, # modified for cql test
+            critic_1,
+            # target_critic_1,
+            critic_1_optimizer,
+            critic_2,
+            # target_critic_2,
+            critic_2_optimizer,
+            # critic, # modified for cql test
             actor,
             actor_optimizer,
             target_entropy: float,
@@ -546,7 +544,7 @@ class ContinuousCQL:
         
         # New parameters for segment-based n-step return Q-learning
         self.use_segment_n_step_return_qf = True  # Use segment n-step return Q-learning
-        self.return_type = "segment_n_step_return_qf"  # Type of return computation
+        self.return_type = "segment_n_step_return_implicit_vf"  # Type of return computation
         # segment_n_step_return_qf
         # segment_n_step_return_implicit_vf
         self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
@@ -567,40 +565,40 @@ class ContinuousCQL:
 
         self.norm_data = False  # Normalize states
 
-        # self.critic_1 = critic_1
-        # self.critic_2 = critic_2
-        #
-        # self.target_critic_1 = deepcopy(self.critic_1).to(device)
-        # self.target_critic_2 = deepcopy(self.critic_2).to(device)
-        # # self.target_critic_1 = target_critic_1
-        # # self.target_critic_2 = target_critic_2
+        self.critic_1 = critic_1
+        self.critic_2 = critic_2
+
+        self.target_critic_1 = deepcopy(self.critic_1).to(device)
+        self.target_critic_2 = deepcopy(self.critic_2).to(device)
+        # self.target_critic_1 = target_critic_1
+        # self.target_critic_2 = target_critic_2
 
         self.actor = actor
 
         self.actor_optimizer = actor_optimizer
-        # self.critic_1_optimizer = critic_1_optimizer
-        # self.critic_2_optimizer = critic_2_optimizer
-        # self.critic = None
+        self.critic_1_optimizer = critic_1_optimizer
+        self.critic_2_optimizer = critic_2_optimizer
+        self.critic = None
 
-        self.critic = critic
+        # self.critic = critic
+        # # self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
+        # #     weight_decay=0.0,
+        # #     learning_rate=self.qf_lr,
+        # #     betas=(0.9, 0.999),
+        # # )
+
+        # self.wd_critic = 1e-5
+        # self.lr_critic = 5e-5
+        # self.betas = (0.9, 0.999)
         # self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
-        #     weight_decay=0.0,
-        #     learning_rate=self.qf_lr,
-        #     betas=(0.9, 0.999),
-        # )
-
-        self.wd_critic = 1e-5
-        self.lr_critic = 5e-5
-        self.betas = (0.9, 0.999)
-        self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
-            weight_decay=self.wd_critic, learning_rate=self.lr_critic,
-            betas=self.betas)
-        self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
-
-        if not self.critic.single_q:
-            self.critic_grad_scaler = [GradScaler(), GradScaler()]
-        else:
-            self.critic_grad_scaler = [GradScaler()] * 2
+        #     weight_decay=self.wd_critic, learning_rate=self.lr_critic,
+        #     betas=self.betas)
+        # self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
+        #
+        # if not self.critic.single_q:
+        #     self.critic_grad_scaler = [GradScaler(), GradScaler()]
+        # else:
+        #     self.critic_grad_scaler = [GradScaler()] * 2
 
         # critic_1, critic_2 = critic.net1, critic.net2
         # target_critic_1, target_critic_2 = critic.target_net1, critic.target_net2
@@ -662,10 +660,10 @@ class ContinuousCQL:
         if num_seg == 1:
             start_idx = 0
         else:
-            # start_idx = 0
+            start_idx = 0
 
-            start_idx = torch.randint(0, seg_length, [],
-                                      dtype=torch.long, device=self._device)
+            # start_idx = torch.randint(0, seg_length, [],
+            #                           dtype=torch.long, device=self._device)
         
         num_seg_actual = (self.traj_length - start_idx) // seg_length
         if pad_additional:
@@ -682,13 +680,13 @@ class ContinuousCQL:
         else:
             return idx_in_segments
 
-    def update_target_network(self, soft_target_update_rate: float):
-        soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
-        soft_update(self.critic.target_net2, self.critic.net2, soft_target_update_rate)
-
     # def update_target_network(self, soft_target_update_rate: float):
-    #     soft_update(self.target_critic_1, self.critic_1, soft_target_update_rate)
-    #     soft_update(self.target_critic_2, self.critic_2, soft_target_update_rate)
+    #     soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
+    #     soft_update(self.critic.target_net2, self.critic.net2, soft_target_update_rate)
+
+    def update_target_network(self, soft_target_update_rate: float):
+        soft_update(self.target_critic_1, self.critic_1, soft_target_update_rate)
+        soft_update(self.target_critic_2, self.critic_2, soft_target_update_rate)
 
     def _alpha_and_alpha_loss(self, observations: torch.Tensor, log_pi: torch.Tensor):
         if self.use_automatic_entropy_tuning:
@@ -701,73 +699,73 @@ class ContinuousCQL:
             alpha = observations.new_tensor(self.alpha_multiplier)
         return alpha, alpha_loss
 
-    def _policy_loss(
-            self,
-            observations: torch.Tensor,
-            actions: torch.Tensor,
-            new_actions: torch.Tensor,
-            alpha: torch.Tensor,
-            log_pi: torch.Tensor,
-    ) -> torch.Tensor:
-        self.critic.eval()  # disable dropout
-        self.critic.requires_grad(False)
-
-        # reshape observations and actions, generate idx for transformer critic
-        observations = observations.unsqueeze(1)
-        idx_c = torch.ones((observations.shape[0], observations.shape[1],), dtype=torch.int64, device=self._device)
-        if new_actions.ndim == 2:
-            new_actions = new_actions.unsqueeze(1).unsqueeze(1)
-            idx_a = torch.ones((observations.shape[0], observations.shape[1], new_actions.shape[1]), dtype=torch.int64, device=self._device)
-        else:
-            # for action_sequence, not checked yet
-            idx_in_segments = self.get_segments()
-            num_segments = idx_in_segments.shape[0]
-            idx_a = idx_in_segments[..., :-1]
-
-
-        if self.total_it <= self.bc_steps:
-            log_probs = self.actor.log_prob(observations, actions)
-            policy_loss = (alpha * log_pi - log_probs).mean()
-        else:
-            # Use new actions for policy loss
-            # with torch.no_grad():
-            q1 = self.critic.critic(
-                    net=self.critic.net1, d_state=None, c_state=observations,
-                    actions=new_actions, idx_d=None, idx_c=idx_c,
-                    idx_a=idx_a)[..., 1:]
-            if not self.critic.single_q:
-                q2 =self.critic.critic(
-                        net=self.critic.net2, d_state=None, c_state=observations,
-                        actions=new_actions, idx_d=None, idx_c=idx_c,
-                        idx_a=idx_a)[..., 1:]
-            else:
-                q2 = q1
-            q_new_actions = torch.minimum(q1, q2)
-
-            q_new_actions = q_new_actions.squeeze()
-
-            policy_loss = (alpha * log_pi - q_new_actions).mean()
-            # TODO: add entropy loss and trust region loss to policy loss
-        return policy_loss
-
     # def _policy_loss(
-    #     self,
-    #     observations: torch.Tensor,
-    #     actions: torch.Tensor,
-    #     new_actions: torch.Tensor,
-    #     alpha: torch.Tensor,
-    #     log_pi: torch.Tensor,
+    #         self,
+    #         observations: torch.Tensor,
+    #         actions: torch.Tensor,
+    #         new_actions: torch.Tensor,
+    #         alpha: torch.Tensor,
+    #         log_pi: torch.Tensor,
     # ) -> torch.Tensor:
+    #     self.critic.eval()  # disable dropout
+    #     self.critic.requires_grad(False)
+    #
+    #     # reshape observations and actions, generate idx for transformer critic
+    #     observations = observations.unsqueeze(1)
+    #     idx_c = torch.ones((observations.shape[0], observations.shape[1],), dtype=torch.int64, device=self._device)
+    #     if new_actions.ndim == 2:
+    #         new_actions = new_actions.unsqueeze(1).unsqueeze(1)
+    #         idx_a = torch.ones((observations.shape[0], observations.shape[1], new_actions.shape[1]), dtype=torch.int64, device=self._device)
+    #     else:
+    #         # for action_sequence, not checked yet
+    #         idx_in_segments = self.get_segments()
+    #         num_segments = idx_in_segments.shape[0]
+    #         idx_a = idx_in_segments[..., :-1]
+    #
+    #
     #     if self.total_it <= self.bc_steps:
     #         log_probs = self.actor.log_prob(observations, actions)
     #         policy_loss = (alpha * log_pi - log_probs).mean()
     #     else:
-    #         q_new_actions = torch.min(
-    #             self.critic_1(observations, new_actions),
-    #             self.critic_2(observations, new_actions),
-    #         )
+    #         # Use new actions for policy loss
+    #         # with torch.no_grad():
+    #         q1 = self.critic.critic(
+    #                 net=self.critic.net1, d_state=None, c_state=observations,
+    #                 actions=new_actions, idx_d=None, idx_c=idx_c,
+    #                 idx_a=idx_a)[..., 1:]
+    #         if not self.critic.single_q:
+    #             q2 =self.critic.critic(
+    #                     net=self.critic.net2, d_state=None, c_state=observations,
+    #                     actions=new_actions, idx_d=None, idx_c=idx_c,
+    #                     idx_a=idx_a)[..., 1:]
+    #         else:
+    #             q2 = q1
+    #         q_new_actions = torch.minimum(q1, q2)
+    #
+    #         q_new_actions = q_new_actions.squeeze()
+    #
     #         policy_loss = (alpha * log_pi - q_new_actions).mean()
+    #         # TODO: add entropy loss and trust region loss to policy loss
     #     return policy_loss
+
+    def _policy_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        new_actions: torch.Tensor,
+        alpha: torch.Tensor,
+        log_pi: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.total_it <= self.bc_steps:
+            log_probs = self.actor.log_prob(observations, actions)
+            policy_loss = (alpha * log_pi - log_probs).mean()
+        else:
+            q_new_actions = torch.min(
+                self.critic_1(observations, new_actions),
+                self.critic_2(observations, new_actions),
+            )
+            policy_loss = (alpha * log_pi - q_new_actions).mean()
+        return policy_loss
 
     # def _q_loss(
     #         self,
@@ -1702,8 +1700,7 @@ class ContinuousCQL:
         # actions in dataset
         # [num_traj, num_segments, segment_length, dim_actions]
         a_idx = idx_in_segments[:, :-1]
-        action_pad_zero_end = torch.nn.functional.pad(actions, (0, 0, 0, num_seg_actions))
-        d_actions = action_pad_zero_end[:, a_idx, :]
+        d_actions = actions[:, a_idx, :]
         a_idx = util.add_expand_dim(a_idx, [0], [num_traj])
 
         # if self.num_samples_in_targets == 1:
@@ -1936,18 +1933,6 @@ class ContinuousCQL:
         mse = torch.nn.MSELoss()
 
         step_batch = [item[:, 0] for item in batch]
-
-        (
-            observations_seq,
-            actions_seq,
-            rewards_seq,
-            next_observations_seq,
-            dones_seq,
-        ) = batch
-
-        rewards_seq = rewards_seq.squeeze()  # [num_traj, traj_length]
-        # actions_seq = rewards_seq.squeeze() # [num_traj, traj_length, dim_action]
-
         (
             observations_step,
             actions_step,
@@ -1957,8 +1942,30 @@ class ContinuousCQL:
         ) = step_batch
         self.total_it += 1
 
-        # new_actions, log_pi = self.actor(observations_step)
-        new_actions, log_pi = self.actor.sample(observations_step, self.num_samples_in_policy)
+        # step_batch = [item[:, 0] for item in batch]
+        #
+        # (
+        #     observations_seq,
+        #     actions_seq,
+        #     rewards_seq,
+        #     next_observations_seq,
+        #     dones_seq,
+        # ) = batch
+        #
+        # rewards_seq = rewards_seq.squeeze()  # [num_traj, traj_length]
+        # # actions_seq = rewards_seq.squeeze() # [num_traj, traj_length, dim_action]
+        #
+        # (
+        #     observations_step,
+        #     actions_step,
+        #     rewards_step,
+        #     next_observations_step,
+        #     dones_step,
+        # ) = step_batch
+        # self.total_it += 1
+
+        new_actions, log_pi = self.actor(observations_step)
+        # new_actions, log_pi = self.actor.sample(observations_step, self.num_samples_in_policy)
         # new_actions_seq = torch.cat([new_actions, actions_seq[..., 1:]], dim=-1,)
         # TODO: use actions_seq to feed transformer to get Q(s, a)
         if self.num_samples_in_policy == 1:
@@ -1972,9 +1979,13 @@ class ContinuousCQL:
         #     observations_step, actions_step, new_actions, alpha, log_pi
         # )
         #
+        policy_loss = self._policy_loss(
+            observations_step, actions_step, new_actions, alpha, log_pi
+        )
+
         log_dict = dict(
             log_pi=log_pi.mean().item(),
-            # policy_loss=policy_loss.item(),
+            policy_loss=policy_loss.item(),
             alpha_loss=alpha_loss.item(),
             alpha=alpha.item(),
         )
@@ -2481,15 +2492,15 @@ class ContinuousCQL:
         #     for cp in p:
         #         cp.requires_grad_(False)
 
-        policy_loss = self._policy_loss(
-            observations_step, actions_step, new_actions, alpha, log_pi
-        )
+        # policy_loss = self._policy_loss(
+        #     observations_step, actions_step, new_actions, alpha, log_pi
+        # )
 
-        log_dict.update(
-            dict(
-            policy_loss=policy_loss.item(),
-            )
-        )
+        # log_dict.update(
+        #     dict(
+        #     policy_loss=policy_loss.item(),
+        #     )
+        # )
 
         if self.use_automatic_entropy_tuning:
             self.alpha_optimizer.zero_grad()
@@ -2516,12 +2527,12 @@ class ContinuousCQL:
         # self.critic_1_optimizer.step()
         # self.critic_2_optimizer.step()
 
-        # # for cql_test
-        # self.critic_1_optimizer.zero_grad()
-        # self.critic_2_optimizer.zero_grad()
-        # qf_loss.backward(retain_graph=True)
-        # self.critic_1_optimizer.step()
-        # self.critic_2_optimizer.step()
+        # for cql_test
+        self.critic_1_optimizer.zero_grad()
+        self.critic_2_optimizer.zero_grad()
+        qf_loss.backward(retain_graph=True)
+        self.critic_1_optimizer.step()
+        self.critic_2_optimizer.step()
 
         if self.total_it % self.target_update_period == 0:
             self.update_target_network(self.soft_target_update_rate)
@@ -2661,14 +2672,14 @@ class ContinuousCQL:
             net=net, d_state=None, c_state=c_state,
             actions=a_rand, idx_d=None, idx_c=c_idx,
             idx_a=a_idx)
-        # cql_current_actions = self.critic.critic(
-        #     net=net, d_state=None, c_state=c_state,
-        #     actions=a_step_c, idx_d=None, idx_c=c_idx,
-        #     idx_a=a_idx)
-        # cql_next_actions = self.critic.critic(
-        #     net=net, d_state=None, c_state=c_state,
-        #     actions=a_step_n, idx_d=None, idx_c=c_idx,
-        #     idx_a=a_idx)
+        cql_current_actions = self.critic.critic(
+            net=net, d_state=None, c_state=c_state,
+            actions=a_step_c, idx_d=None, idx_c=c_idx,
+            idx_a=a_idx)
+        cql_next_actions = self.critic.critic(
+            net=net, d_state=None, c_state=c_state,
+            actions=a_step_n, idx_d=None, idx_c=c_idx,
+            idx_a=a_idx)
 
         # TODO: cat dim incorrect, implement top-k sampling first
         # [num_batch, num_segments, segment_length] -> [num_batch, num_segments, segment_length, 1 + 3*K_samples]
@@ -2677,8 +2688,8 @@ class ContinuousCQL:
                 [
                     cql_rand[..., 1:].unsqueeze(-2),
                     vq_predict[..., 1:].unsqueeze(-2),
-                    # cql_next_actions[..., 1:].unsqueeze(-2),
-                    # cql_current_actions[..., 1:].unsqueeze(-2),
+                    cql_next_actions[..., 1:].unsqueeze(-2),
+                    cql_current_actions[..., 1:].unsqueeze(-2),
                 ],
                 dim=-2,
             )
@@ -2687,8 +2698,8 @@ class ContinuousCQL:
                 [
                     cql_rand[..., 1:],
                     vq_predict[..., 1:].unsqueeze(-2),
-                    # cql_next_actions[..., 1:],
-                    # cql_current_actions[..., 1:],
+                    cql_next_actions[..., 1:],
+                    cql_current_actions[..., 1:],
                 ],
                 dim=-2,
             )
@@ -2700,8 +2711,8 @@ class ContinuousCQL:
             cql_cat = torch.cat(
                 [
                     cql_rand[..., 1:] - random_density,
-                    # cql_next_actions[..., 1:] - log_pi_n.detach(),
-                    # cql_current_actions[..., 1:] - log_pi_c.detach(),
+                    cql_next_actions[..., 1:] - log_pi_n.detach(),
+                    cql_current_actions[..., 1:] - log_pi_c.detach(),
                 ],
                 dim=-2,
             )
@@ -2747,21 +2758,20 @@ class ContinuousCQL:
 @pyrallis.wrap()
 def train(config: TrainConfig, cw_config: dict = None) -> None:
     env = gym.make(config.env)
-    env_2 = gym.make(config.env)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
-    dataset_2 = d4rl.qlearning_dataset(env_2, terminate_on_end=True)
+    # dataset = d4rl.qlearning_dataset(env)
+    dataset_2 = d4rl.qlearning_dataset(env, terminate_on_end=True)
 
     if config.normalize_reward:
-        modify_reward(
-            dataset,
-            config.env,
-            reward_scale=config.reward_scale,
-            reward_bias=config.reward_bias,
-        )
+        # modify_reward(
+        #     dataset,
+        #     config.env,
+        #     reward_scale=config.reward_scale,
+        #     reward_bias=config.reward_bias,
+        # )
 
         modify_reward(
             dataset_2,
@@ -2771,30 +2781,24 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         )
 
     if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+        state_mean, state_std = compute_mean_std(dataset_2["observations"], eps=1e-3)
     else:
         state_mean, state_std = 0, 1
 
-    if config.normalize:
-        state_mean_2, state_std_2 = compute_mean_std(dataset_2["observations"], eps=1e-3)
-    else:
-        state_mean_2, state_std_2 = 0, 1
-
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
+    dataset_2["observations"] = normalize_states(
+        dataset_2["observations"], state_mean, state_std
     )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+    dataset_2["next_observations"] = normalize_states(
+        dataset_2["next_observations"], state_mean, state_std
     )
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    # env_2 = wrap_env(env_2, state_mean=state_mean, state_std=state_std)
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
-        config.buffer_size,
-        config.device,
-    )
-    replay_buffer.load_d4rl_dataset(dataset)
+    # replay_buffer = ReplayBuffer(
+    #     state_dim,
+    #     action_dim,
+    #     config.buffer_size,
+    #     config.device,
+    # )
+    # replay_buffer.load_d4rl_dataset(dataset_2)
 
     replay_buffer_data_shape = {
         "observations": (state_dim,),
@@ -2831,47 +2835,6 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
 
     replay_buffer_modular_seq.load_d4rl_dataset(dataset_2)
     replay_buffer_modular_seq.update_buffer_normalizer()
-
-    # batch = replay_buffer.sample(config.batch_size)
-    # batch = [b.to(config.device) for b in batch]
-    #
-    # batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=True)
-    # batch_seq = convert_batch_dict_to_list(batch_seq)
-    # batch_seq = [b.to(config.device) for b in batch_seq]
-    #
-    # step_batch = [item[:, 0] for item in batch_seq]
-    #
-    # (
-    #     observations_seq,
-    #     actions_seq,
-    #     rewards_seq,
-    #     next_observations_seq,
-    #     dones_seq,
-    # ) = batch_seq
-    #
-    # rewards_seq = rewards_seq.squeeze()  # [num_traj, traj_length]
-    # # actions_seq = rewards_seq.squeeze() # [num_traj, traj_length, dim_action]
-    #
-    # (
-    #     observations_step,
-    #     actions_step,
-    #     rewards_step,
-    #     next_observations_step,
-    #     dones_step,
-    # ) = step_batch
-    #
-    # (
-    #     observations,
-    #     actions,
-    #     rewards,
-    #     next_observations,
-    #     dones,
-    # ) = batch
-    #
-    # print("normalized reward by rp", rewards.mean(), observations.mean(),
-    #       "normalized reward by modular rp", rewards_step.mean(), observations_step.mean(),
-    #       "normalized reward by modular rp seq", rewards_seq.mean(), observations_seq.mean())
-
 
     max_action = float(env.action_space.high[0])
 
@@ -2921,7 +2884,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         "relative_pos": False
     }
 
-    critic = seq_critic.SeqCritic(**critic_config)
+    # critic = seq_critic.SeqCritic(**critic_config)
 
     # critic_1, critic_2 = critic.net1, critic.net2
     # target_critic_1, target_critic_2 = critic.target_net1, critic.target_net2
@@ -2931,106 +2894,40 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
     #     betas=(0.9, 0.999),
     # )
 
-    # # CQL original codebase test
-    # cql_critic_1 = FullyConnectedQFunction(
-    #     state_dim,
-    #     action_dim,
-    #     config.orthogonal_init,
-    #     config.q_n_hidden_layers,
-    # ).to(config.device)
-    # cql_critic_2 = FullyConnectedQFunction(
-    #     state_dim,
-    #     action_dim,
-    #     config.orthogonal_init,
-    # ).to(config.device)
-    #
-    # cql_critic_1_optimizer = torch.optim.Adam(list(cql_critic_1.parameters()), config.qf_lr)
-    # cql_critic_2_optimizer = torch.optim.Adam(list(cql_critic_2.parameters()), config.qf_lr)
+    # CQL original codebase test
+    cql_critic_1 = FullyConnectedQFunction(
+        state_dim,
+        action_dim,
+        config.orthogonal_init,
+        config.q_n_hidden_layers,
+    ).to(config.device)
+    cql_critic_2 = FullyConnectedQFunction(
+        state_dim,
+        action_dim,
+        config.orthogonal_init,
+    ).to(config.device)
+
+    cql_critic_1_optimizer = torch.optim.Adam(list(cql_critic_1.parameters()), config.qf_lr)
+    cql_critic_2_optimizer = torch.optim.Adam(list(cql_critic_2.parameters()), config.qf_lr)
     # cql_target_critic_1 = deepcopy(cql_critic_1).to(config.device)
     # cql_target_critic_2 = deepcopy(cql_critic_2).to(config.device)
 
-    # cql_actor = TanhGaussianPolicy(
-    #     state_dim,
-    #     action_dim,
-    #     max_action,
-    #     log_std_multiplier=config.policy_log_std_multiplier,
-    #     orthogonal_init=config.orthogonal_init,
-    # ).to(config.device)
-    # cql_actor_optimizer = torch.optim.Adam(cql_actor.parameters(), config.policy_lr)
-
-    # cql_kwargs = {
-    #     "critic_1": cql_critic_1,
-    #     "critic_2": cql_critic_2,
-    #     "critic_1_optimizer": cql_critic_1_optimizer,
-    #     "critic_2_optimizer": cql_critic_2_optimizer,
-    #     "actor": cql_actor,
-    #     "actor_optimizer": cql_actor_optimizer,
-    #     "discount": config.discount,
-    #     "soft_target_update_rate": config.soft_target_update_rate,
-    #     "device": config.device,
-    #     # CQL
-    #     "target_entropy": -np.prod(env.action_space.shape).item(),
-    #     "alpha_multiplier": config.alpha_multiplier,
-    #     "use_automatic_entropy_tuning": config.use_automatic_entropy_tuning,
-    #     "backup_entropy": config.backup_entropy,
-    #     "policy_lr": config.policy_lr,
-    #     "qf_lr": config.qf_lr,
-    #     "bc_steps": config.bc_steps,
-    #     "target_update_period": config.target_update_period,
-    #     "cql_n_actions": config.cql_n_actions,
-    #     "cql_importance_sample": config.cql_importance_sample,
-    #     "cql_lagrange": config.cql_lagrange,
-    #     "cql_target_action_gap": config.cql_target_action_gap,
-    #     "cql_temp": config.cql_temp,
-    #     "cql_alpha": config.cql_alpha,
-    #     "cql_max_target_backup": config.cql_max_target_backup,
-    #     "cql_clip_diff_min": config.cql_clip_diff_min,
-    #     "cql_clip_diff_max": config.cql_clip_diff_max,
-    # }
-
-
-    policy_kwargs = {
-        "mean_net_args": {
-            "avg_neuron": 256,
-            "num_hidden": 3,
-            "shape": 0.0,
-        },
-        "variance_net_args": {
-            "std_only": True,
-            "contextual": True,
-            "avg_neuron": 256,
-            "num_hidden": 3,
-            "shape": 0.0,
-        },
-        "init_method": "orthogonal",
-        "out_layer_gain": 0.01,
-        "min_std": 1e-5,
-        "act_func_hidden": "leaky_relu",
-        "act_func_last": None,
-    }
-
-    actor = pl.TanhGaussianPolicy(
+    cql_actor = TanhGaussianPolicy(
         state_dim,
         action_dim,
-        max_action=max_action,
+        max_action,
         log_std_multiplier=config.policy_log_std_multiplier,
         orthogonal_init=config.orthogonal_init,
-        device=config.device,
-        **policy_kwargs,
-    )
+    ).to(config.device)
+    cql_actor_optimizer = torch.optim.Adam(cql_actor.parameters(), config.policy_lr)
 
-    actor_optimizer = torch.optim.Adam(actor.parameters, config.policy_lr)
-
-    kwargs = {
-        # "critic_1": critic_1,
-        # "critic_2": critic_2,
-        # "target_critic_1": target_critic_1,
-        # "target_critic_2": target_critic_2,
-        # "critic_1_optimizer": critic_1_optimizer,
-        # "critic_2_optimizer": critic_2_optimizer,
-        "critic": critic,
-        "actor": actor,
-        "actor_optimizer": actor_optimizer,
+    cql_kwargs = {
+        "critic_1": cql_critic_1,
+        "critic_2": cql_critic_2,
+        "critic_1_optimizer": cql_critic_1_optimizer,
+        "critic_2_optimizer": cql_critic_2_optimizer,
+        "actor": cql_actor,
+        "actor_optimizer": cql_actor_optimizer,
         "discount": config.discount,
         "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
@@ -3052,25 +2949,91 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         "cql_max_target_backup": config.cql_max_target_backup,
         "cql_clip_diff_min": config.cql_clip_diff_min,
         "cql_clip_diff_max": config.cql_clip_diff_max,
-        # # New parameters for segment-based critic update
-        # "use_segment_critic_update": config.use_segment_critic_update,
-        # "epochs_critic": config.epochs_critic,
-        # "segment_length": config.segment_length,
-        # "num_segments": config.num_segments,
-        # "n_step_return": config.n_step_return,
-        # "clip_grad_norm": config.clip_grad_norm,
-        # "use_mix_precision": config.use_mix_precision,
-        # # New parameters for segment-based n-step return Q-learning
-        # "use_segment_n_step_return_qf": config.use_segment_n_step_return_qf,
-        # "return_type": config.return_type,
     }
+
+
+    # policy_kwargs = {
+    #     "mean_net_args": {
+    #         "avg_neuron": 256,
+    #         "num_hidden": 3,
+    #         "shape": 0.0,
+    #     },
+    #     "variance_net_args": {
+    #         "std_only": True,
+    #         "contextual": True,
+    #         "avg_neuron": 256,
+    #         "num_hidden": 3,
+    #         "shape": 0.0,
+    #     },
+    #     "init_method": "orthogonal",
+    #     "out_layer_gain": 0.01,
+    #     "min_std": 1e-5,
+    #     "act_func_hidden": "leaky_relu",
+    #     "act_func_last": None,
+    # }
+
+    # actor = pl.TanhGaussianPolicy(
+    #     state_dim,
+    #     action_dim,
+    #     max_action=max_action,
+    #     log_std_multiplier=config.policy_log_std_multiplier,
+    #     orthogonal_init=config.orthogonal_init,
+    #     device=config.device,
+    #     **policy_kwargs,
+    # )
+    #
+    # actor_optimizer = torch.optim.Adam(actor.parameters, config.policy_lr)
+
+    # kwargs = {
+    #     # "critic_1": critic_1,
+    #     # "critic_2": critic_2,
+    #     # "target_critic_1": target_critic_1,
+    #     # "target_critic_2": target_critic_2,
+    #     # "critic_1_optimizer": critic_1_optimizer,
+    #     # "critic_2_optimizer": critic_2_optimizer,
+    #     "critic": critic,
+    #     "actor": cql_actor,
+    #     "actor_optimizer": actor_optimizer,
+    #     "discount": config.discount,
+    #     "soft_target_update_rate": config.soft_target_update_rate,
+    #     "device": config.device,
+    #     # CQL
+    #     "target_entropy": -np.prod(env.action_space.shape).item(),
+    #     "alpha_multiplier": config.alpha_multiplier,
+    #     "use_automatic_entropy_tuning": config.use_automatic_entropy_tuning,
+    #     "backup_entropy": config.backup_entropy,
+    #     "policy_lr": config.policy_lr,
+    #     "qf_lr": config.qf_lr,
+    #     "bc_steps": config.bc_steps,
+    #     "target_update_period": config.target_update_period,
+    #     "cql_n_actions": config.cql_n_actions,
+    #     "cql_importance_sample": config.cql_importance_sample,
+    #     "cql_lagrange": config.cql_lagrange,
+    #     "cql_target_action_gap": config.cql_target_action_gap,
+    #     "cql_temp": config.cql_temp,
+    #     "cql_alpha": config.cql_alpha,
+    #     "cql_max_target_backup": config.cql_max_target_backup,
+    #     "cql_clip_diff_min": config.cql_clip_diff_min,
+    #     "cql_clip_diff_max": config.cql_clip_diff_max,
+    #     # # New parameters for segment-based critic update
+    #     # "use_segment_critic_update": config.use_segment_critic_update,
+    #     # "epochs_critic": config.epochs_critic,
+    #     # "segment_length": config.segment_length,
+    #     # "num_segments": config.num_segments,
+    #     # "n_step_return": config.n_step_return,
+    #     # "clip_grad_norm": config.clip_grad_norm,
+    #     # "use_mix_precision": config.use_mix_precision,
+    #     # # New parameters for segment-based n-step return Q-learning
+    #     # "use_segment_n_step_return_qf": config.use_segment_n_step_return_qf,
+    #     # "return_type": config.return_type,
+    # }
 
     print("---------------------------------------")
     print(f"Training CQL, Env: {config.env}, Seed: {seed}")
     print("---------------------------------------")
 
     # Initialize actor
-    trainer = ContinuousCQL(**kwargs) # modified for cql test
+    trainer = ContinuousCQL(**cql_kwargs) # modified for cql test
 
     if config.load_model != "":
         policy_file = Path(config.load_model)
@@ -3100,7 +3063,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
             print(f"Time steps: {t + 1}")
             eval_scores = eval_actor(
                 env,
-                actor,
+                cql_actor,
                 device=config.device,
                 n_episodes=config.n_episodes,
                 seed=config.seed,
@@ -3115,22 +3078,6 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
                 f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
             )
             print("---------------------------------------")
-            eval_scores_2 = eval_actor(
-                env_2,
-                actor,
-                device=config.device,
-                n_episodes=config.n_episodes,
-                seed=config.seed,
-            )
-            eval_score_2 = eval_scores_2.mean()
-            normalized_eval_score_2 = env_2.get_normalized_score(eval_score_2) * 100.0
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score_2:.3f} , D4RL score: {normalized_eval_score_2:.3f}"
-            )
-            print("---------------------------------------")
-
             if config.checkpoints_path:
                 torch.save(
                     trainer.state_dict(),

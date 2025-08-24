@@ -23,7 +23,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda"
+    device: str = "cuda:1"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -58,7 +58,7 @@ class TrainConfig:
     reward_scale: float = 5.0  # Reward scale for normalization
     reward_bias: float = -1.0  # Reward bias for normalization
     policy_log_std_multiplier: float = 1.0  # Stochastic policy std multiplier
-    project: str = "CORL"  # wandb project name
+    project: str = "TORL"  # wandb project name
     group: str = "CQL-D4RL"  # wandb group name
     name: str = "CQL"  # wandb run name
 
@@ -707,6 +707,7 @@ class ContinuousCQL:
                 average_qf1=q1_predicted.mean().item(),
                 average_qf2=q2_predicted.mean().item(),
                 average_target_q=target_q_values.mean().item(),
+                average_reward=rewards.mean().item(),
             )
         )
 
@@ -855,6 +856,7 @@ def train(config: TrainConfig):
     dataset["next_observations"] = normalize_states(
         dataset["next_observations"], state_mean, state_std
     )
+    print(state_mean, state_std)
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
     replay_buffer = ReplayBuffer(
         state_dim,
@@ -939,14 +941,14 @@ def train(config: TrainConfig):
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
 
-    # wandb_init(asdict(config))
+    wandb_init(asdict(config))
 
     evaluations = []
     for t in range(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
-        # wandb.log(log_dict, step=trainer.total_it)
+        wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             print(f"Time steps: {t + 1}")
@@ -971,10 +973,10 @@ def train(config: TrainConfig):
                     trainer.state_dict(),
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
-            # wandb.log(
-            #     {"d4rl_normalized_score": normalized_eval_score},
-            #     step=trainer.total_it,
-            # )
+            wandb.log(
+                {"d4rl_normalized_score": normalized_eval_score},
+                step=trainer.total_it,
+            )
 
 
 if __name__ == "__main__":

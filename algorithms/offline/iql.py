@@ -19,6 +19,9 @@ import wandb
 from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+import algorithms.cw_offline.rl.replay_buffer as rb
+
+
 TensorBatch = List[torch.Tensor]
 
 
@@ -30,7 +33,7 @@ LOG_STD_MAX = 2.0
 @dataclass
 class TrainConfig:
     # wandb project name
-    project: str = "CORL"
+    project: str = "TORL"
     # wandb group name
     group: str = "IQL-D4RL"
     # wandb run name
@@ -451,7 +454,9 @@ class ImplicitQLearning:
         terminals: torch.Tensor,
         log_dict: Dict,
     ):
-        targets = rewards + (1.0 - terminals.float()) * self.discount * next_v.detach()
+        # targets = rewards + (1.0 - terminals.float()) * self.discount * next_v.detach()
+        targets = rewards + self.discount * next_v.detach()
+
         qs = self.qf.both(observations, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
         log_dict["q_loss"] = q_loss.item()
@@ -488,13 +493,23 @@ class ImplicitQLearning:
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
+        # (
+        #     observations,
+        #     actions,
+        #     rewards,
+        #     next_observations,
+        #     dones,
+        # ) = batch
+
+        step_batch = [item[:, 0] for item in batch]
         (
             observations,
             actions,
             rewards,
             next_observations,
             dones,
-        ) = batch
+        ) = step_batch
+
         log_dict = {}
 
         with torch.no_grad():
@@ -554,20 +569,46 @@ def train(config: TrainConfig):
     else:
         state_mean, state_std = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
-    )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
-    )
+    # dataset["observations"] = normalize_states(
+    #     dataset["observations"], state_mean, state_std
+    # )
+    # dataset["next_observations"] = normalize_states(
+    #     dataset["next_observations"], state_mean, state_std
+    # )
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
+    # replay_buffer = ReplayBuffer(
+    #     state_dim,
+    #     action_dim,
+    #     config.buffer_size,
+    #     config.device,
+    # )
+    # replay_buffer.load_d4rl_dataset(dataset)
+
+    replay_buffer_data_shape = {
+        "observations": (state_dim,),
+        "actions": (action_dim,),
+        "rewards": (1,),
+        "next_observations": (state_dim,),
+        "terminals": (1,),
+    }
+    replay_buffer_norm_info = {
+        "observations": True,
+        "actions": False,
+        "rewards": False,
+        "next_observations": True,
+        "terminals": False,
+    }
+
+    replay_buffer_modular_seq = rb.SeqReplayBuffer(
+        replay_buffer_data_shape,
+        replay_buffer_norm_info,
         config.buffer_size,
-        config.device,
+        device=config.device,
     )
-    replay_buffer.load_d4rl_dataset(dataset)
+
+    replay_buffer_modular_seq.load_d4rl_dataset(dataset)
+    replay_buffer_modular_seq.update_buffer_normalizer()
+
 
     max_action = float(env.action_space.high[0])
 
@@ -629,9 +670,14 @@ def train(config: TrainConfig):
 
     evaluations = []
     for t in range(int(config.max_timesteps)):
-        batch = replay_buffer.sample(config.batch_size)
-        batch = [b.to(config.device) for b in batch]
-        log_dict = trainer.train(batch)
+        # batch = replay_buffer.sample(config.batch_size)
+        # batch = [b.to(config.device) for b in batch]
+
+        batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=True)
+        batch_seq = convert_batch_dict_to_list(batch_seq)
+        batch_seq = [b.to(config.device) for b in batch_seq]
+
+        log_dict = trainer.train(batch_seq)
         wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
@@ -645,6 +691,7 @@ def train(config: TrainConfig):
             )
             eval_score = eval_scores.mean()
             normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+            print("min score:", env.ref_min_score)
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
@@ -660,6 +707,16 @@ def train(config: TrainConfig):
             wandb.log(
                 {"d4rl_normalized_score": normalized_eval_score}, step=trainer.total_it
             )
+
+def convert_batch_dict_to_list(batch: dict) -> List[torch.Tensor]:
+    return [
+        batch["observations"],
+        batch["actions"],
+        batch["rewards"],
+        batch["next_observations"],
+        batch["terminals"].float()  # make sure it's float if it's bool
+    ]
+
 
 
 if __name__ == "__main__":
