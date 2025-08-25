@@ -31,6 +31,8 @@ from torch.cuda.amp import GradScaler
 
 from tqdm import tqdm
 
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 import os, torch
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 torch.autograd.set_detect_anomaly(True)
@@ -43,10 +45,10 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda:1"
+    device: str = "cuda:2"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
-    eval_freq: int = 1 # int(5e2)  # How often (time steps) we evaluate
+    eval_freq: int = int(5e2)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
     checkpoints_path: Optional[str] = None  # Save path
@@ -79,8 +81,8 @@ class TrainConfig:
     reward_bias: float = -1.0  # Reward bias for normalization
     policy_log_std_multiplier: float = 1.0  # Stochastic policy std multiplier
     project: str = "TORL"  # wandb project name
-    group: str = "TCQL-D4RL"  # wandb group name
-    name: str = "TCQL_normalized_rand"  # wandb run name
+    group: str = "TIQL-D4RL"  # wandb group name
+    name: str = "TIQL_modified_p_ploss"  # wandb run name
 
     # New parameters for segment-based critic update
     use_segment_critic_update: bool = False  # Use segment-based critic update
@@ -187,6 +189,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int) -> TensorBatch:
         indices = np.random.randint(0, min(self._size, self._pointer), size=batch_size)
+        # indices = np.arange(batch_size)
         states = self._states[indices]
         actions = self._actions[indices]
         rewards = self._rewards[indices]
@@ -546,13 +549,13 @@ class ContinuousCQL:
         
         # New parameters for segment-based n-step return Q-learning
         self.use_segment_n_step_return_qf = True  # Use segment n-step return Q-learning
-        self.return_type = "segment_n_step_return_qf"  # Type of return computation
+        self.return_type = "segment_n_step_return_implicit_vf"  # Type of return computation
         # segment_n_step_return_qf
         # segment_n_step_return_implicit_vf
         self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
         self.num_samples_in_policy = 1
         self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
-        self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda:1")
+        self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda:2")
 
         self.random_target = True  # Use random target for segment n-step return
         self.discount_factor = torch.tensor(float(1),
@@ -631,6 +634,8 @@ class ContinuousCQL:
 
         self.iql_tau = 0.7
 
+        self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, 1000000)
+
 
     def get_segments(self, pad_additional=False):
         """Generate segment indices for critic update.
@@ -700,6 +705,34 @@ class ContinuousCQL:
             alpha_loss = observations.new_tensor(0.0)
             alpha = observations.new_tensor(self.alpha_multiplier)
         return alpha, alpha_loss
+
+    def _update_policy(
+        self,
+        adv: torch.Tensor,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        log_dict: Dict,
+    ):
+        # EXP_ADV_MAX = 100.0
+        # beta: float = 3.0
+        exp_adv = torch.exp(3.0 * adv.detach()).clamp(max=100.0)
+        # policy_out = self.actor(observations)
+        _, p_mean, p_std = self.actor.policy(observations)
+        policy_out = Normal(p_mean, p_std)
+        if isinstance(policy_out, torch.distributions.Distribution):
+            bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
+        elif torch.is_tensor(policy_out):
+            if policy_out.shape != actions.shape:
+                raise RuntimeError("Actions shape missmatch")
+            bc_losses = torch.sum((policy_out - actions) ** 2, dim=1)
+        else:
+            raise NotImplementedError
+        policy_loss = torch.mean(exp_adv * bc_losses)
+        log_dict["actor_loss"] = policy_loss.item()
+        self.actor_optimizer.zero_grad()
+        policy_loss.backward()
+        self.actor_optimizer.step()
+        self.actor_lr_schedule.step()
 
     def _policy_loss(
             self,
@@ -2010,6 +2043,9 @@ class ContinuousCQL:
             targets_list = []
             targets_bias_list = []
 
+            # targets = None
+            # vq_pred = None
+
             # Generate segments using the reusable get_segments method
             num_traj = observations_seq.shape[0]
             traj_length = observations_seq.shape[1]
@@ -2444,6 +2480,12 @@ class ContinuousCQL:
                     update_target_net_time.append(
                         util.run_time_test(lock=False,
                                            key="copy critic net"))
+
+                    # IQL policy update
+                    adv = targets[..., 1] - vq_pred[..., 0]
+                    action_start_idx = idx_in_segments[..., 0]
+                    c_action =  actions_seq[:, action_start_idx]
+                    self._update_policy(adv, c_state, c_action, log_dict)
             # Note: Use N-step V-func return for segment-wise update
             elif self.return_type == "v_func":
                 raise NotImplementedError
@@ -2481,24 +2523,29 @@ class ContinuousCQL:
         #     for cp in p:
         #         cp.requires_grad_(False)
 
-        policy_loss = self._policy_loss(
-            observations_step, actions_step, new_actions, alpha, log_pi
-        )
+        # IQL
+        # adv = targets[..., 1] - vq_pred[..., 0]
+        # self._update_policy(adv, observations_step, actions_step, log_dict)
 
-        log_dict.update(
-            dict(
-            policy_loss=policy_loss.item(),
-            )
-        )
-
-        if self.use_automatic_entropy_tuning:
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-
-        self.actor_optimizer.zero_grad()
-        policy_loss.backward()
-        self.actor_optimizer.step()
+        # CQL
+        # policy_loss = self._policy_loss(
+        #     observations_step, actions_step, new_actions, alpha, log_pi
+        # )
+        #
+        # log_dict.update(
+        #     dict(
+        #     policy_loss=policy_loss.item(),
+        #     )
+        # )
+        #
+        # if self.use_automatic_entropy_tuning:
+        #     self.alpha_optimizer.zero_grad()
+        #     alpha_loss.backward()
+        #     self.alpha_optimizer.step()
+        #
+        # self.actor_optimizer.zero_grad()
+        # policy_loss.backward()
+        # self.actor_optimizer.step()
 
         # # unfreeze critic params afterwards
         # for p in self.critic.parameters:
@@ -2746,22 +2793,22 @@ class ContinuousCQL:
 
 @pyrallis.wrap()
 def train(config: TrainConfig, cw_config: dict = None) -> None:
-    env = gym.make(config.env)
+    # env = gym.make(config.env)
     env_2 = gym.make(config.env)
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    state_dim = env_2.observation_space.shape[0]
+    action_dim = env_2.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
+    # dataset = d4rl.qlearning_dataset(env)
     dataset_2 = d4rl.qlearning_dataset(env_2, terminate_on_end=True)
 
     if config.normalize_reward:
-        modify_reward(
-            dataset,
-            config.env,
-            reward_scale=config.reward_scale,
-            reward_bias=config.reward_bias,
-        )
+        # modify_reward(
+        #     dataset,
+        #     config.env,
+        #     reward_scale=config.reward_scale,
+        #     reward_bias=config.reward_bias,
+        # )
 
         modify_reward(
             dataset_2,
@@ -2770,31 +2817,41 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
             reward_bias=config.reward_bias,
         )
 
-    if config.normalize:
-        state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
-    else:
-        state_mean, state_std = 0, 1
+    # if config.normalize:
+    #     state_mean, state_std = compute_mean_std(dataset["observations"], eps=1e-3)
+    # else:
+    #     state_mean, state_std = 0, 1
 
     if config.normalize:
         state_mean_2, state_std_2 = compute_mean_std(dataset_2["observations"], eps=1e-3)
     else:
         state_mean_2, state_std_2 = 0, 1
 
-    dataset["observations"] = normalize_states(
-        dataset["observations"], state_mean, state_std
+    # print("state_mean from dataset", state_mean_2, state_std_2, state_mean_2.mean(), state_std_2.mean())
+
+    # dataset["observations"] = normalize_states(
+    #     dataset["observations"], state_mean, state_std
+    # )
+    # dataset["next_observations"] = normalize_states(
+    #     dataset["next_observations"], state_mean, state_std
+    # )
+
+    dataset_2["observations"] = normalize_states(
+        dataset_2["observations"], state_mean_2, state_std_2
     )
-    dataset["next_observations"] = normalize_states(
-        dataset["next_observations"], state_mean, state_std
+    dataset_2["next_observations"] = normalize_states(
+        dataset_2["next_observations"], state_mean_2, state_std_2
     )
-    env = wrap_env(env, state_mean=state_mean, state_std=state_std)
-    # env_2 = wrap_env(env_2, state_mean=state_mean, state_std=state_std)
-    replay_buffer = ReplayBuffer(
-        state_dim,
-        action_dim,
-        config.buffer_size,
-        config.device,
-    )
-    replay_buffer.load_d4rl_dataset(dataset)
+
+    # env = wrap_env(env, state_mean=state_mean, state_std=state_std)
+    env = wrap_env(env_2, state_mean=state_mean_2, state_std=state_std_2)
+    # replay_buffer = ReplayBuffer(
+    #     state_dim,
+    #     action_dim,
+    #     config.buffer_size,
+    #     config.device,
+    # )
+    # replay_buffer.load_d4rl_dataset(dataset)
 
     replay_buffer_data_shape = {
         "observations": (state_dim,),
@@ -2835,7 +2892,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
     # batch = replay_buffer.sample(config.batch_size)
     # batch = [b.to(config.device) for b in batch]
     #
-    # batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=True)
+    # batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False)
     # batch_seq = convert_batch_dict_to_list(batch_seq)
     # batch_seq = [b.to(config.device) for b in batch_seq]
     #
@@ -2989,32 +3046,64 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
     # }
 
 
+    # CQL policy
+    # policy_kwargs = {
+    #     "mean_net_args": {
+    #         "avg_neuron": 256,
+    #         "num_hidden": 3,
+    #         "shape": 0.0,
+    #     },
+    #     "variance_net_args": {
+    #         "std_only": True,
+    #         "contextual": True,
+    #         "avg_neuron": 256,
+    #         "num_hidden": 3,
+    #         "shape": 0.0,
+    #     },
+    #     "init_method": "orthogonal",
+    #     "out_layer_gain": 0.01,
+    #     "min_std": 1e-5,
+    #     "act_func_hidden": "leaky_relu",
+    #     "act_func_last": None,
+    # }
+    #
+    # actor = pl.TanhGaussianPolicy(
+    #     state_dim,
+    #     action_dim,
+    #     max_action=max_action,
+    #     log_std_multiplier=config.policy_log_std_multiplier,
+    #     orthogonal_init=config.orthogonal_init,
+    #     device=config.device,
+    #     **policy_kwargs,
+    # )
+
+    # IQL policy
     policy_kwargs = {
         "mean_net_args": {
             "avg_neuron": 256,
-            "num_hidden": 3,
+            "num_hidden": 2,
             "shape": 0.0,
         },
         "variance_net_args": {
             "std_only": True,
-            "contextual": True,
-            "avg_neuron": 256,
-            "num_hidden": 3,
-            "shape": 0.0,
+            "contextual": False,  # state-independent parameter
+            # "avg_neuron": 256,
+            # "num_hidden": 3,
+            # "shape": 0.0,
         },
-        "init_method": "orthogonal",
-        "out_layer_gain": 0.01,
-        "min_std": 1e-5,
-        "act_func_hidden": "leaky_relu",
-        "act_func_last": None,
+        "init_method": "orthogonal",  # "orthogonal",
+        "out_layer_gain": 1.0,  # 0.01,
+        # "min_std": 1e-5,
+        "act_func_hidden": "relu",
+        "act_func_last": "tanh",
     }
 
-    actor = pl.TanhGaussianPolicy(
+    actor = pl.GaussianPolicy(
         state_dim,
         action_dim,
         max_action=max_action,
-        log_std_multiplier=config.policy_log_std_multiplier,
-        orthogonal_init=config.orthogonal_init,
+        # log_std_multiplier=1.0,
+        # orthogonal_init=False,
         device=config.device,
         **policy_kwargs,
     )
@@ -3088,7 +3177,8 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         # # print(batch[0].size())
         # batch = [b.to(config.device) for b in batch]
 
-        batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False)
+        # TODO: dimensionwise normalization
+        batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False) # normalize only for the sampled batch
         batch_seq = convert_batch_dict_to_list(batch_seq)
         batch_seq = [b.to(config.device) for b in batch_seq]
 
@@ -3115,21 +3205,21 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
                 f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
             )
             print("---------------------------------------")
-            eval_scores_2 = eval_actor(
-                env_2,
-                actor,
-                device=config.device,
-                n_episodes=config.n_episodes,
-                seed=config.seed,
-            )
-            eval_score_2 = eval_scores_2.mean()
-            normalized_eval_score_2 = env_2.get_normalized_score(eval_score_2) * 100.0
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score_2:.3f} , D4RL score: {normalized_eval_score_2:.3f}"
-            )
-            print("---------------------------------------")
+            # eval_scores_2 = eval_actor(
+            #     env_2,
+            #     actor,
+            #     device=config.device,
+            #     n_episodes=config.n_episodes,
+            #     seed=config.seed,
+            # )
+            # eval_score_2 = eval_scores_2.mean()
+            # normalized_eval_score_2 = env_2.get_normalized_score(eval_score_2) * 100.0
+            # print("---------------------------------------")
+            # print(
+            #     f"Evaluation over {config.n_episodes} episodes: "
+            #     f"{eval_score_2:.3f} , D4RL score: {normalized_eval_score_2:.3f}"
+            # )
+            # print("---------------------------------------")
 
             if config.checkpoints_path:
                 torch.save(

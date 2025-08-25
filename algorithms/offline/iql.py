@@ -20,6 +20,7 @@ from torch.distributions import Normal
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import algorithms.cw_offline.rl.replay_buffer as rb
+import algorithms.cw_offline.rl.policy as pl
 
 
 TensorBatch = List[torch.Tensor]
@@ -37,7 +38,7 @@ class TrainConfig:
     # wandb group name
     group: str = "IQL-D4RL"
     # wandb run name
-    name: str = "IQL"
+    name: str = "IQL_rp_a"
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     # discount factor
@@ -70,7 +71,7 @@ class TrainConfig:
     #  where to use dropout for policy network, optional
     actor_dropout: Optional[float] = None
     # evaluation frequency, will evaluate every eval_freq training steps
-    eval_freq: int = int(5e3)
+    eval_freq: int = int(5e3) # 5000
     # number of episodes to run during evaluation
     n_episodes: int = 10
     # path for checkpoints saving, optional
@@ -80,7 +81,9 @@ class TrainConfig:
     # training random seed
     seed: int = 0
     # training device
-    device: str = "cuda"
+    device: str = "cuda:3"
+
+    policy_lr: float = 3e-4
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -460,6 +463,8 @@ class ImplicitQLearning:
         qs = self.qf.both(observations, actions)
         q_loss = sum(F.mse_loss(q, targets) for q in qs) / len(qs)
         log_dict["q_loss"] = q_loss.item()
+        for i, q in enumerate(qs, start=1):
+            log_dict[f"q{i}"] = q.mean().item()
         self.q_optimizer.zero_grad()
         q_loss.backward()
         self.q_optimizer.step()
@@ -475,7 +480,9 @@ class ImplicitQLearning:
         log_dict: Dict,
     ):
         exp_adv = torch.exp(self.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
-        policy_out = self.actor(observations)
+        # policy_out = self.actor(observations)
+        _, p_mean, p_std = self.actor.policy(observations)
+        policy_out = Normal(p_mean, p_std)
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions).sum(-1, keepdim=False)
         elif torch.is_tensor(policy_out):
@@ -569,12 +576,12 @@ def train(config: TrainConfig):
     else:
         state_mean, state_std = 0, 1
 
-    # dataset["observations"] = normalize_states(
-    #     dataset["observations"], state_mean, state_std
-    # )
-    # dataset["next_observations"] = normalize_states(
-    #     dataset["next_observations"], state_mean, state_std
-    # )
+    dataset["observations"] = normalize_states(
+        dataset["observations"], state_mean, state_std
+    )
+    dataset["next_observations"] = normalize_states(
+        dataset["next_observations"], state_mean, state_std
+    )
     env = wrap_env(env, state_mean=state_mean, state_std=state_std)
     # replay_buffer = ReplayBuffer(
     #     state_dim,
@@ -624,18 +631,50 @@ def train(config: TrainConfig):
 
     q_network = TwinQ(state_dim, action_dim).to(config.device)
     v_network = ValueFunction(state_dim).to(config.device)
-    actor = (
-        DeterministicPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
-        if config.iql_deterministic
-        else GaussianPolicy(
-            state_dim, action_dim, max_action, dropout=config.actor_dropout
-        )
-    ).to(config.device)
+    # actor = (
+    #     DeterministicPolicy(
+    #         state_dim, action_dim, max_action, dropout=config.actor_dropout
+    #     )
+    #     if config.iql_deterministic
+    #     else GaussianPolicy(
+    #         state_dim, action_dim, max_action, dropout=config.actor_dropout
+    #     )
+    # ).to(config.device)
     v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
     q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
+    # actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
+
+    policy_kwargs = {
+        "mean_net_args": {
+            "avg_neuron": 256,
+            "num_hidden": 2,
+            "shape": 0.0,
+        },
+        "variance_net_args": {
+            "std_only": True,
+            "contextual": False,  # state-independent parameter
+            # "avg_neuron": 256,
+            # "num_hidden": 3,
+            # "shape": 0.0,
+        },
+        "init_method": "orthogonal",  # "orthogonal",
+        "out_layer_gain": 1.0,  # 0.01,
+        # "min_std": 1e-5,
+        "act_func_hidden": "relu",
+        "act_func_last": "tanh",
+    }
+
+    actor = pl.GaussianPolicy(
+        state_dim,
+        action_dim,
+        max_action=max_action,
+        # log_std_multiplier=1.0,
+        # orthogonal_init=False,
+        device=config.device,
+        **policy_kwargs,
+    )
+
+    actor_optimizer = torch.optim.Adam(actor.parameters, config.policy_lr)
 
     kwargs = {
         "max_action": max_action,
@@ -673,7 +712,7 @@ def train(config: TrainConfig):
         # batch = replay_buffer.sample(config.batch_size)
         # batch = [b.to(config.device) for b in batch]
 
-        batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=True)
+        batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False)
         batch_seq = convert_batch_dict_to_list(batch_seq)
         batch_seq = [b.to(config.device) for b in batch_seq]
 

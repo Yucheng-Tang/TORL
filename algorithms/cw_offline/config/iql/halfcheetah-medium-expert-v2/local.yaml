@@ -1,0 +1,14 @@
+# cw2 config
+name: iql_halfcheetah-medium-expert-v2
+import_path: "./iql.yaml"
+import_exp: "iqlhalfcheetah-medium-expert-v2"
+
+repetitions: 1
+reps_per_job: 1
+reps_in_parallel: 1
+iterations: &iterations 1000000
+num_checkpoints: 1
+
+# Hardware specific parameters
+
+

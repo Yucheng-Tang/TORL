@@ -5,6 +5,7 @@ from .abstract_agent import *
 # from .black_box_agent import *
 from .seq_agent import *
 from .step_agent import *
+from .implicit_seq_agent import *
 # from .seq_agent_multiprocessing import *
 
 def agent_factory(typ: Literal["TemporalCorrelatedAgent"],

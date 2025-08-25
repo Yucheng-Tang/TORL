@@ -170,6 +170,8 @@ class SeqReplayBuffer:
                                 device=self.device)
         else:
             idx = torch.randint(0, self._size, (batch_size,), device=self.device)
+            # idx = torch.zeros((batch_size,), device=self.device)
+            # idx = torch.arange(batch_size, device=self.device)
         smp_dict = dict()
 
         terminal_key = next((k for k in self.replay_buffer if "done" in k or "dones" in k or "terminals" in k), None)
