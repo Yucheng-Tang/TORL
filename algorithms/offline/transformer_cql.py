@@ -45,7 +45,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda:2"
+    device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -222,6 +222,7 @@ def wandb_init(config: dict) -> None:
         project=config["project"],
         group=config["group"],
         name=config["name"],
+        entity="tyc1333",
         id=str(uuid.uuid4()),
     )
     wandb.run.save()
@@ -555,7 +556,7 @@ class ContinuousCQL:
         self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
         self.num_samples_in_policy = 1
         self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
-        self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda:2")
+        self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda")
 
         self.random_target = True  # Use random target for segment n-step return
         self.discount_factor = torch.tensor(float(1),
@@ -1675,6 +1676,7 @@ class ContinuousCQL:
     def segments_n_step_return_implicit_vf(self,
             observations: torch.Tensor,
             actions: torch.Tensor,
+            next_observations: torch.Tensor,
             rewards: torch.Tensor,
             dones: torch.Tensor,
             idx_in_segments: torch.Tensor,):
@@ -1815,18 +1817,19 @@ class ContinuousCQL:
         c_idx = util.add_expand_dim(c_idx, [0], [num_traj])
 
         # [num_traj, traj_length, dim_state]
-        c_state = states
+        # c_state = states
+        n_state = next_observations  # [num_traj, traj_length, dim_state]
 
         # Use mix precision for faster computation
         with util.autocast_if(self.use_mix_precision):
             # [num_traj, traj_length]
             future_v1 = self.critic.critic(self.critic.target_net1,
-                                           d_state=None, c_state=c_state,
+                                           d_state=None, c_state=n_state,
                                            actions=None, idx_d=None,
                                            idx_c=c_idx, idx_a=None).squeeze(-1)
             if not self.critic.single_q:
                 future_v2 = self.critic.critic(self.critic.target_net2,
-                                               d_state=None, c_state=c_state,
+                                               d_state=None, c_state=n_state,
                                                actions=None, idx_d=None,
                                                idx_c=c_idx, idx_a=None).squeeze(-1)
             else:
@@ -1845,7 +1848,8 @@ class ContinuousCQL:
             = torch.nn.functional.pad(future_v, (0, num_seg_actions))
 
         # [num_segments, num_seg_actions]
-        v_idx = idx_in_segments[:, 1:]
+        # v_idx = idx_in_segments[:, 1:]
+        v_idx = idx_in_segments[:, :-1]
         # assert v_idx.max() <= traj_length
 
         # [num_traj, traj_length] -> [num_traj, num_segments, num_seg_actions]
@@ -1978,7 +1982,7 @@ class ContinuousCQL:
             dones_seq,
         ) = batch
 
-        rewards_seq = rewards_seq.squeeze()  # [num_traj, traj_length]
+        rewards_seq = rewards_seq.squeeze(-1)  # [num_traj, traj_length]
         # actions_seq = rewards_seq.squeeze() # [num_traj, traj_length, dim_action]
 
         (
@@ -2377,6 +2381,7 @@ class ContinuousCQL:
                 targets = self.segments_n_step_return_implicit_vf(
                     observations_seq,
                     actions_seq,
+                    next_observations_seq,
                     rewards_seq,
                     dones_seq,
                     idx_in_segments)
@@ -2481,12 +2486,25 @@ class ContinuousCQL:
                         util.run_time_test(lock=False,
                                            key="copy critic net"))
 
-                    # IQL policy update
-                    adv = targets[..., 1] - vq_pred[..., 0]
-                    action_start_idx = idx_in_segments[..., 0]
-                    c_action =  actions_seq[:, action_start_idx]
-                    self._update_policy(adv, c_state, c_action, log_dict)
-            # Note: Use N-step V-func return for segment-wise update
+                # IQL policy update
+                with torch.no_grad():
+                    # online V predictions from both critics (average them to update policy)
+                    v1_online = self.critic.critic(self.critic.net1,
+                                                   d_state=None, c_state=c_state,
+                                                   actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+                    if self.critic.single_q:
+                        v_avg = v1_online
+                    else:
+                        v2_online = self.critic.critic(self.critic.net2,
+                                                       d_state=None, c_state=c_state,
+                                                       actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+                        v_avg = 0.5 * (v1_online + v2_online)
+
+                adv = (targets[..., 1] - v_avg).detach()
+                action_start_idx = idx_in_segments[..., 0]
+                c_action =  actions_seq[:, action_start_idx]
+                self._update_policy(adv, c_state, c_action, log_dict)
+        # Note: Use N-step V-func return for segment-wise update
             elif self.return_type == "v_func":
                 raise NotImplementedError
 
