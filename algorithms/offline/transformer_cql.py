@@ -54,7 +54,7 @@ class TrainConfig:
     checkpoints_path: Optional[str] = None  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
     buffer_size: int = 2_000_000  # Replay buffer size
-    batch_size: int = 64  # Batch size for all networks
+    batch_size: int = 256  # Batch size for all networks
     discount: float = 0.99  # Discount factor
     alpha_multiplier: float = 1.0  # Multiplier for alpha in loss
     use_automatic_entropy_tuning: bool = True  # Tune entropy
@@ -82,7 +82,7 @@ class TrainConfig:
     policy_log_std_multiplier: float = 1.0  # Stochastic policy std multiplier
     project: str = "TORL"  # wandb project name
     group: str = "TIQL-D4RL"  # wandb group name
-    name: str = "TIQL_modified_p_ploss"  # wandb run name
+    name: str = "TIQL_modified_p_ploss_256"  # wandb run name
 
     # New parameters for segment-based critic update
     use_segment_critic_update: bool = False  # Use segment-based critic update
@@ -717,6 +717,8 @@ class ContinuousCQL:
         # EXP_ADV_MAX = 100.0
         # beta: float = 3.0
         exp_adv = torch.exp(3.0 * adv.detach()).clamp(max=100.0)
+        log_dict["exp_adv_mean"] = exp_adv.mean().item()
+        log_dict["exp_adv_max"] = exp_adv.max().item()
         # policy_out = self.actor(observations)
         _, p_mean, p_std = self.actor.policy(observations)
         policy_out = Normal(p_mean, p_std)
@@ -2501,6 +2503,7 @@ class ContinuousCQL:
                         v_avg = 0.5 * (v1_online + v2_online)
 
                 adv = (targets[..., 1] - v_avg).detach()
+                log_dict.update({"1step_adv": adv.mean().item()}) # should >0
                 action_start_idx = idx_in_segments[..., 0]
                 c_action =  actions_seq[:, action_start_idx]
                 self._update_policy(adv, c_state, c_action, log_dict)
@@ -2984,7 +2987,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         "single_q": False,
         "device": config.device,
         "dtype": "float32",
-        "update_rate": config.soft_target_update_rate,
+        # "update_rate": config.soft_target_update_rate,
         "bias": True,
         "n_embd": 128,
         "block_size": 1024,

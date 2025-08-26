@@ -21,6 +21,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 import algorithms.cw_offline.rl.replay_buffer as rb
 import algorithms.cw_offline.rl.policy as pl
+import algorithms.cw_offline.util as util
+import algorithms.cw_offline.rl.critic.seq_critic as seq_critic
+
+from torch.cuda.amp import GradScaler
 
 
 TensorBatch = List[torch.Tensor]
@@ -47,9 +51,11 @@ class TrainConfig:
     tau: float = 0.005
     # actor update inverse temperature, similar to AWAC
     # small beta -> BC, big beta -> maximizing Q-value
-    beta: float = 3.0
+    beta: float = 6.0
     # coefficient for asymmetric critic loss
-    iql_tau: float = 0.7
+    # small tau -> optimistic, big beta -> conservative
+    # (tau-1)
+    iql_tau: float = 0.55 # 0.7
     # whether to use deterministic actor
     iql_deterministic: bool = False
     # total gradient updates during training
@@ -71,7 +77,7 @@ class TrainConfig:
     #  where to use dropout for policy network, optional
     actor_dropout: Optional[float] = None
     # evaluation frequency, will evaluate every eval_freq training steps
-    eval_freq: int = int(5e3) # 5000
+    eval_freq: int = int(1e3) # 5000
     # number of episodes to run during evaluation
     n_episodes: int = 10
     # path for checkpoints saving, optional
@@ -209,6 +215,7 @@ def wandb_init(config: dict) -> None:
         project=config["project"],
         group=config["group"],
         name=config["name"],
+        entity="tyc1333",
         id=str(uuid.uuid4()),
     )
     wandb.run.save()
@@ -406,24 +413,34 @@ class ImplicitQLearning:
         max_action: float,
         actor: nn.Module,
         actor_optimizer: torch.optim.Optimizer,
-        q_network: nn.Module,
-        q_optimizer: torch.optim.Optimizer,
-        v_network: nn.Module,
-        v_optimizer: torch.optim.Optimizer,
+        critic: nn.Module,
+        # q_network: nn.Module,
+        # q_optimizer: torch.optim.Optimizer,
+        # v_network: nn.Module,
+        # v_optimizer: torch.optim.Optimizer,
         iql_tau: float = 0.7,
         beta: float = 3.0,
         max_steps: int = 1000000,
         discount: float = 0.99,
         tau: float = 0.005,
         device: str = "cpu",
+        # TIQL
+        dtype: torch.dtype = torch.float32,
+        wd_critic: int = 1e-5,
+        lr_critic: int = 5e-5,
+        betas: tuple = (0.9, 0.999),
+        use_mix_precision: bool = False,
+        soft_target_update_rate: float = 5e-3,
+        target_update_period: int = 1,
+        random_target: bool = True,
     ):
         self.max_action = max_action
-        self.qf = q_network
-        self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
-        self.vf = v_network
+        # self.qf = q_network
+        # self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
+        # self.vf = v_network
         self.actor = actor
-        self.v_optimizer = v_optimizer
-        self.q_optimizer = q_optimizer
+        # self.v_optimizer = v_optimizer
+        # self.q_optimizer = q_optimizer
         self.actor_optimizer = actor_optimizer
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, max_steps)
         self.iql_tau = iql_tau
@@ -433,6 +450,38 @@ class ImplicitQLearning:
 
         self.total_it = 0
         self.device = device
+
+        # added for TIQL
+        self.dtype = dtype
+        self.num_segments = 5
+        # Initialize traj_length (will be set during training)
+        self.traj_length = None
+
+        self.critic = critic
+        self.wd_critic = wd_critic
+        self.lr_critic = lr_critic
+        self.betas = betas
+        self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
+            weight_decay=self.wd_critic, learning_rate=self.lr_critic,
+            betas=self.betas)
+        self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
+
+        if not self.critic.single_q:
+            self.critic_grad_scaler = [GradScaler(), GradScaler()]
+        else:
+            self.critic_grad_scaler = [GradScaler()] * 2
+
+        self.discount_factor = torch.tensor(float(1),
+                                            dtype=self.dtype,
+                                            device=self.device)
+        self.use_mix_precision = use_mix_precision
+        self.soft_target_update_rate = soft_target_update_rate
+        self.target_update_period = target_update_period
+        self.random_target = random_target
+
+        self.log_now = False
+        self.clip_grad_norm = 1.0
+
 
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
         # Update value function
@@ -531,14 +580,14 @@ class ImplicitQLearning:
             # start_idx = 0
 
             start_idx = torch.randint(0, seg_length, [],
-                                      dtype=torch.long, device=self._device)
+                                      dtype=torch.long, device=self.device)
 
         num_seg_actual = (self.traj_length - start_idx) // seg_length
         if pad_additional:
             num_seg_actual += 1
 
         idx_in_segments = torch.arange(0, num_seg_actual * seg_length,
-                                       device=self._device) + start_idx
+                                       device=self.device) + start_idx
         idx_in_segments = idx_in_segments.view(-1, seg_length)
         idx_in_segments = torch.cat([idx_in_segments,
                                      idx_in_segments[:, -1:] + 1], dim=-1)
@@ -574,35 +623,10 @@ class ImplicitQLearning:
 
         num_traj, traj_length = states.shape[0], states.shape[1]
 
-        # NOTE: additional dimension is defined as [num_traj, num_segments]
-        # TODO: MP actor related part removed, action sampling is also not necessary? use action in the dataset or directly V(s_t+n)?
-
-        # # [num_traj, num_segments, num_seg_actions, dim_action] or
-        # # [num_traj, num_segments, num_smps, num_seg_actions, dim_action]
-        # actions = self.policy.sample(require_grad=False,
-        #                              params_mean=params_mean_new,
-        #                              params_L=params_L_new, times=action_times,
-        #                              init_time=init_time,
-        #                              init_pos=init_pos, init_vel=init_vel,
-        #                              use_mean=False,
-        #                              num_samples=self.num_samples_in_targets)
-        #
-        # # Normalize actions
-        # if self.norm_data:
-        #     actions = self.replay_buffer.normalize_data("step_actions", actions)
-
         ##################### Compute the current n_step Q using dataset actions  ######################
         # [num_traj, num_segments, 1 + num_seg_actions]
         future_returns = torch.zeros([num_traj, num_segments,
                                       1 + num_seg_actions], device=self.device)
-
-        # [num_traj, dim_state] -> [num_traj, num_segments, dim_state]
-        # d_state = states[
-        #     torch.arange(num_traj, device=self.device), decision_idx]
-        # d_state = util.add_expand_dim(d_state, [1], [num_segments])
-
-        # [num_traj] -> [num_traj, num_segments]
-        # d_idx = util.add_expand_dim(decision_idx, [1], [num_segments])
 
         # [num_traj, num_segments, dim_state]
         c_state = states[:, seg_start_idx]
@@ -614,29 +638,6 @@ class ImplicitQLearning:
         action_pad_zero_end = torch.nn.functional.pad(actions, (0, 0, 0, num_seg_actions))
         d_actions = action_pad_zero_end[:, a_idx, :]
         a_idx = util.add_expand_dim(a_idx, [0], [num_traj])
-
-        # if self.num_samples_in_targets == 1:
-        #     # [num_traj, num_segments]
-        #     c_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
-        #
-        #     # [num_segments, num_seg_actions]
-        #     # -> [num_traj, num_segments, num_seg_actions]
-        #     a_idx = util.add_expand_dim(idx_in_segments[..., :-1],
-        #                                 [0], [num_traj])
-        # else:
-        #     num_smp = self.num_samples_in_targets
-        #
-        #     # -> [num_traj, num_segments, num_smp, dim_state]
-        #     c_state = util.add_expand_dim(c_state, [2], [num_smp])
-        #
-        #     # [num_traj, num_segments, num_smp]
-        #     c_idx = util.add_expand_dim(seg_start_idx, [0, 2],
-        #                                 [num_traj, num_smp])
-        #     # [num_segments, num_seg_actions]
-        #     # -> [num_traj, num_segments, num_smp, num_seg_actions]
-        #     a_idx = util.add_expand_dim(idx_in_segments[..., :-1],
-        #                                 [0, 2],
-        #                                 [num_traj, num_smp])
 
         # Use mix precision for faster computation
         with util.autocast_if(self.use_mix_precision):
@@ -661,9 +662,6 @@ class ImplicitQLearning:
         else:
             future_q = torch.minimum(future_q1, future_q2)
 
-        # if self.num_samples_in_targets > 1:
-        #     future_q = future_q.mean(dim=-2)
-
         # Use last q as the target of the V-func
         # [num_traj, num_segments, 1 + num_seg_actions]
         # -> [num_traj, num_segments]
@@ -676,13 +674,40 @@ class ImplicitQLearning:
         future_returns[:, -1, 0] = (
             future_q[:, -1, last_valid_q_idx].squeeze(-1))
 
-        # # Option, Use the average q predictions, exclude the vf at 0th place
-        # # Option does not work well
-        # # future_returns[:, :-1, 0] = future_q[:, :-1, 1:].mean(dim=-1)
+        # try with current Q instead of target Q
+        # with util.autocast_if(self.use_mix_precision):
+        #     with torch.no_grad():
+        #         cur_q1 = self.critic.critic(self.critic.net1,
+        #                                     d_state=None, c_state=c_state,
+        #                                     actions=d_actions, idx_d=None,
+        #                                     idx_c=c_idx, idx_a=a_idx)
+        #         if not self.critic.single_q:
+        #             cur_q2 = self.critic.critic(self.critic.net2,
+        #                                         d_state=None, c_state=c_state,
+        #                                         actions=d_actions, idx_d=None,
+        #                                         idx_c=c_idx, idx_a=a_idx)
+        #         else:
+        #             cur_q2 = cur_q1
+        #
+        #         # if self.random_target and not self.targets_overestimate:
+        #         if self.random_target:
+        #             # Randomly choose the Q value from Q1 or Q2
+        #             mask = torch.randint(0, 2, cur_q1.shape, device=self.device)
+        #             cur_q = cur_q1 * mask + cur_q2 * (1 - mask)
+        #         else:
+        #             cur_q = torch.minimum(cur_q1, cur_q2)
+        #
+        # # Use last q as the target of the V-func
+        # # [num_traj, num_segments, 1 + num_seg_actions]
+        # # -> [num_traj, num_segments]
+        # # Tackle the Q-func beyond the length of the trajectory
+        # # Option, Use the last q predictions
+        # future_returns[:, :-1, 0] = cur_q[:, :-1, -1]
         #
         # # Find the idx where the action is the last action in the valid trajectory
-        # # last_valid_q_idx = (idx_in_segments[-1] <= traj_length)[1:]
-        # # future_returns[:, -1, 0] = future_q[:, -1, 1:][..., last_valid_q_idx].mean(dim=-1)
+        # last_valid_q_idx = idx_in_segments[-1] == traj_length
+        # future_returns[:, -1, 0] = (
+        #     cur_q[:, -1, last_valid_q_idx].squeeze(-1))
 
         ##################### Compute the V in the future ######################
         # state after executing the action
@@ -796,6 +821,40 @@ class ImplicitQLearning:
 
         return n_step_returns
 
+    # def train(self, batch: TensorBatch) -> Dict[str, float]:
+    #     self.total_it += 1
+    #     (
+    #         observations_seq,
+    #         actions_seq,
+    #         rewards_seq,
+    #         next_observations_seq,
+    #         dones_seq,
+    #     ) = batch
+    #
+    #     step_batch = [item[:, 0] for item in batch]
+    #     (
+    #         observations,
+    #         actions,
+    #         rewards,
+    #         next_observations,
+    #         dones,
+    #     ) = step_batch
+    #
+    #     log_dict = {}
+    #
+    #     with torch.no_grad():
+    #         next_v = self.vf(next_observations)
+    #     # Update value function
+    #     adv = self._update_v(observations, actions, log_dict)
+    #     rewards = rewards.squeeze(dim=-1)
+    #     dones = dones.squeeze(dim=-1)
+    #     # Update Q function
+    #     self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+    #     # Update actor
+    #     self._update_policy(adv, observations, actions, log_dict)
+    #
+    #     return log_dict
+
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
         (
@@ -806,29 +865,260 @@ class ImplicitQLearning:
             dones_seq,
         ) = batch
 
+        rewards_seq = rewards_seq.squeeze(-1)
+
         step_batch = [item[:, 0] for item in batch]
         (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
+            observations_step,
+            actions_step,
+            rewards_step,
+            next_observations_step,
+            dones_step,
         ) = step_batch
 
         log_dict = {}
 
+        mse = torch.nn.MSELoss()
+        # util.run_time_test(lock=True, key="update critic")
+        self.critic.train()
+        self.critic.requires_grad(True)
+        # Initialize scalers for mixed precision
+        if self.use_mix_precision:
+            scaler_1 = torch.cuda.amp.GradScaler()
+            scaler_2 = torch.cuda.amp.GradScaler()
+        else:
+            scaler_1 = scaler_2 = None
+
+        # Use segment-based n-step return Q-learning
+        critic_loss_list = []
+        critic_grad_norm = []
+        clipped_critic_grad_norm = []
+
+        # Time logs for critic updates
+        update_critic_net_time = []
+        update_target_net_time = []
+
+        # Value estimation error log
+        mc_returns_list = []
+        targets_list = []
+        targets_bias_list = []
+
+        # targets = None
+        # vq_pred = None
+
+        # Generate segments using the reusable get_segments method
+        num_traj = observations_seq.shape[0]
+        traj_length = observations_seq.shape[1]
+
+        # Set traj_length for get_segments method
+        self.traj_length = traj_length
+
+        # Use segment-based n-step return Q-learning (similar to SeqQAgent)
+        idx_in_segments = self.get_segments(pad_additional=True)
+        seg_start_idx = idx_in_segments[..., 0]
+        assert seg_start_idx[-1] < self.traj_length
+        seg_actions_idx = idx_in_segments[..., :-1]
+        num_seg_actions = seg_actions_idx.shape[-1]
+
+        # [num_traj, num_segments, dim_state]
+        c_state = observations_seq[:, seg_start_idx]
+        seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
+
+        # for CQL step-based actor, c_state_seq [num_traj, num_segments, segments_length, dim_state]
+        seg_state_idx = idx_in_segments[..., :-1]
+        num_seg_state = seg_state_idx.shape[-1]
+        padded_states_c = torch.nn.functional.pad(
+            observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
+        padded_states_n = torch.nn.functional.pad(
+            next_observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
+
+        c_state_seq = padded_states_c[:, seg_state_idx]
+        n_state_seq = padded_states_n[:, seg_state_idx]
+        seg_state_idx = util.add_expand_dim(seg_state_idx, [0], [num_traj])
+
+        padded_actions = torch.nn.functional.pad(
+            actions_seq, (0, 0, 0, num_seg_actions), "constant", 0)
+
+        # [num_traj, num_segments, num_seg_actions, dim_action]
+        seg_actions = padded_actions[:, seg_actions_idx]
+
+        # [num_traj, num_segments, num_seg_actions]
+        seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
+                                              [num_traj])
+
+        targets = self.segments_n_step_return_implicit_vf(
+            observations_seq,
+            actions_seq,
+            rewards_seq,
+            dones_seq,
+            idx_in_segments)
+
+        # Log targets and MC returns
+        # if self.log_now:
+        mc_returns_mean = util.compute_mc_return(
+            rewards_seq.mean(dim=0),
+            self.discount_factor).mean().item()
+
+        mc_returns_list.append(mc_returns_mean)
+        targets_mean = targets.mean().item()
+        targets_list.append(targets_mean)
+        targets_bias_list.append(targets_mean - mc_returns_mean)
+
+        log_dict.update(
+            dict(
+                mc_returns_mean=mc_returns_mean,
+                targets_mean=targets_mean,
+                targets_bias_mean=targets_mean - mc_returns_mean,
+            )
+        )
+
+        # qf_loss = 0.0
+
+        for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
+            # Use mix precision for faster computation
+            with util.autocast_if(self.use_mix_precision):
+                # [num_traj, num_segments, 1 + num_seg_actions]
+                vq_pred = self.critic.critic(
+                    net=net, d_state=None, c_state=c_state,
+                    actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+                    idx_a=seg_actions_idx)
+
+                # Mask out the padded actions
+                # [num_traj, num_segments, num_seg_actions]
+                valid_mask = seg_actions_idx < self.traj_length
+
+                # [num_traj, num_segments, num_seg_actions]
+                vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
+                targets[..., 1:] = targets[..., 1:] * valid_mask
+
+                # Loss
+                q_diff = vq_pred[..., 1:] - targets[..., 1:]
+                q_sum = torch.sum(q_diff ** 2)
+                v_diff = vq_pred[..., 0] - targets[..., 0]
+                v_sum = torch.sum(v_diff ** 2)
+                critic_loss = mse(vq_pred[..., 1:], targets[..., 1:])
+                # print(vq_pred[..., 1:], targets[..., 1:], critic_loss, ((vq_pred[..., 1:]-targets[..., 1:])**2).mean())
+                iql_loss = asymmetric_l2_loss(v_diff, self.iql_tau)
+                critic_loss = critic_loss + iql_loss
+                # expectile loss for  V and mse for Q
+
+                qf1_value = vq_pred[..., 1] - targets[..., 1]
+
+                # qf_loss = qf_loss + critic_loss
+                # print("critic_loss", critic_loss.item())
+
+                log_dict.update(
+                    {
+                        f"{net_name}_1step_q_diff": qf1_value.mean().item(),
+                        f"{net_name}_1step_q": vq_pred[..., 1].mean().item(),
+                        f"{net_name}_q_mean": vq_pred[..., 1:].mean().item(),
+                        f"{net_name}_target_mean": targets[..., 1:].mean().item(),
+                        f"{net_name}_return_mean": mc_returns_mean,
+                        f"{net_name}_v": vq_pred[..., 0].mean().item(),
+                        f"{net_name}_q_loss": critic_loss.item(),
+                        f"{net_name}_iql_loss": iql_loss.item(),
+                    }
+                )
+
+            # Update critic net parameters
+            # util.run_time_test(lock=True, key="update critic net")
+            opt.zero_grad(set_to_none=True)
+
+            # critic_loss.backward()
+            scaler.scale(critic_loss).backward()
+
+            if self.clip_grad_norm > 0 or self.log_now:
+                grad_norm, grad_norm_c = util.grad_norm_clip(
+                    self.clip_grad_norm, net.parameters())
+            else:
+                grad_norm, grad_norm_c = 0., 0.
+
+            # opt.step()
+            scaler.step(opt)
+            scaler.update()
+
+            # update_critic_net_time.append(
+            #     util.run_time_test(lock=False,
+            #                        key="update critic net"))
+
+            # Logging
+            critic_loss_list.append(critic_loss.item())
+            critic_grad_norm.append(grad_norm)
+            clipped_critic_grad_norm.append(grad_norm_c)
+
+            # Update target network
+            # util.run_time_test(lock=True, key="copy critic net")
+            self.critic.update_target_net(net, target_net)
+            # update_target_net_time.append(
+            #     util.run_time_test(lock=False,
+            #                        key="copy critic net"))
+
+        # IQL policy update
+        self.critic.eval()  # disable dropout
+        self.critic.requires_grad(False)
         with torch.no_grad():
-            next_v = self.vf(next_observations)
-        # Update value function
-        adv = self._update_v(observations, actions, log_dict)
-        rewards = rewards.squeeze(dim=-1)
-        dones = dones.squeeze(dim=-1)
-        # Update Q function
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-        # Update actor
-        self._update_policy(adv, observations, actions, log_dict)
+            # online V predictions from both critics (average them to update policy)
+            v1_online = self.critic.critic(self.critic.net1,
+                                           d_state=None, c_state=c_state,
+                                           actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+            if self.critic.single_q:
+                v_avg = v1_online
+            else:
+                v2_online = self.critic.critic(self.critic.net2,
+                                               d_state=None, c_state=c_state,
+                                               actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+                v_avg = 0.5 * (v1_online + v2_online)
+
+        adv = (targets[..., 1] - v_avg).detach()
+        adv_np = adv.detach().cpu().numpy()
+        adv_p95 = np.percentile(adv_np, 95)
+        adv_std = adv_np.std()
+        adv_min = adv_np.min()
+        adv_max = adv_np.max()
+        log_dict.update({"1step_adv": adv.mean().item(),
+                         "adv_p95": float(adv_p95),
+                         "adv_std": float(adv_std),
+                         "adv_min": float(adv_min),
+                         "adv_max": float(adv_max),
+                         })  # should >0
+        action_start_idx = idx_in_segments[..., 0]
+        c_action = actions_seq[:, action_start_idx]
+        self._update_policy(adv, c_state, c_action, log_dict)
+
+        # if self.total_it % self.target_update_period == 0:
+        #     self.update_target_network(self.soft_target_update_rate)
 
         return log_dict
+
+        # with torch.no_grad():
+        #     next_v = self.vf(next_observations)
+        # # Update value function
+        # adv = self._update_v(observations, actions, log_dict)
+        # rewards = rewards.squeeze(dim=-1)
+        # dones = dones.squeeze(dim=-1)
+        # # Update Q function
+        # self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        # # Update actor
+        # self._update_policy(adv, observations, actions, log_dict)
+        #
+        # return log_dict
+
+    def update_target_network(self, soft_target_update_rate: float):
+        soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
+        soft_update(self.critic.target_net2, self.critic.net2, soft_target_update_rate)
+
+    def critic_nets_and_opt(self):
+        if self.critic.single_q:
+            return zip(["net1"],
+                       util.make_iterable(self.critic.net1, "list"),
+                       util.make_iterable(self.critic.target_net1, "list"),
+                       util.make_iterable(self.critic_optimizer[0], "list"),
+                       util.make_iterable(self.critic_grad_scaler[0], "list"))
+        else:
+            return zip(["net1", "net2"],
+                       [self.critic.net1, self.critic.net2],
+                       [self.critic.target_net1, self.critic.target_net2],
+                       self.critic_optimizer, self.critic_grad_scaler)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -942,6 +1232,25 @@ def train(config: TrainConfig):
     q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
     # actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
 
+    critic_config = {
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "single_q": False,
+        "device": config.device,
+        "dtype": "float32",
+        "bias": True,
+        "n_embd": 128,
+        "block_size": 1024,
+        "dropout": 0.0,
+        "n_layer": 2,
+        "n_head": 8,
+        "update_rate": 0.005,
+        "use_layer_norm": True,
+        "relative_pos": False
+    }
+
+    critic = seq_critic.SeqCritic(**critic_config)
+
     policy_kwargs = {
         "mean_net_args": {
             "avg_neuron": 256,
@@ -978,17 +1287,19 @@ def train(config: TrainConfig):
         "max_action": max_action,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
-        "q_network": q_network,
-        "q_optimizer": q_optimizer,
-        "v_network": v_network,
-        "v_optimizer": v_optimizer,
+        # "q_network": q_network,
+        # "q_optimizer": q_optimizer,
+        # "v_network": v_network,
+        # "v_optimizer": v_optimizer,
         "discount": config.discount,
         "tau": config.tau,
         "device": config.device,
         # IQL
+        "critic": critic,
         "beta": config.beta,
         "iql_tau": config.iql_tau,
         "max_steps": config.max_timesteps,
+        # TIQL
     }
 
     print("---------------------------------------")
