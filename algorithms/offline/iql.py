@@ -55,7 +55,7 @@ class TrainConfig:
     # coefficient for asymmetric critic loss
     # small tau -> optimistic, big beta -> conservative
     # (tau-1)
-    iql_tau: float = 0.55 # 0.7
+    iql_tau: float = 0.95 # 0.7
     # whether to use deterministic actor
     iql_deterministic: bool = False
     # total gradient updates during training
@@ -998,7 +998,9 @@ class ImplicitQLearning:
                 v_sum = torch.sum(v_diff ** 2)
                 critic_loss = mse(vq_pred[..., 1:], targets[..., 1:])
                 # print(vq_pred[..., 1:], targets[..., 1:], critic_loss, ((vq_pred[..., 1:]-targets[..., 1:])**2).mean())
-                iql_loss = asymmetric_l2_loss(v_diff, self.iql_tau)
+                # asymmetric_l2_loss is different from the lecture
+                # TODO: test and rewrite it as in the lecture
+                iql_loss = asymmetric_l2_loss(-v_diff, self.iql_tau)
                 critic_loss = critic_loss + iql_loss
                 # expectile loss for  V and mse for Q
 
