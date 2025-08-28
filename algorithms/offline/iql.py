@@ -413,12 +413,13 @@ class ImplicitQLearning:
         max_action: float,
         actor: nn.Module,
         actor_optimizer: torch.optim.Optimizer,
+        # standard iql
+        # q_network: nn.Module,
+        # q_optimizer: torch.optim.Optimizer,
+        # v_network: nn.Module,
+        # v_optimizer: torch.optim.Optimizer,
         # TIQL
-        # critic: nn.Module,
-        q_network: nn.Module,
-        q_optimizer: torch.optim.Optimizer,
-        v_network: nn.Module,
-        v_optimizer: torch.optim.Optimizer,
+        critic: nn.Module,
         iql_tau: float = 0.7,
         beta: float = 3.0,
         max_steps: int = 1000000,
@@ -438,13 +439,13 @@ class ImplicitQLearning:
         self.max_action = max_action
         self.actor = actor
         # standard iql
-        self.qf = q_network
-        self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
-        self.vf = v_network
-        self.v_optimizer = v_optimizer
-        self.q_optimizer = q_optimizer
+        # self.qf = q_network
+        # self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
+        # self.vf = v_network
+        # self.v_optimizer = v_optimizer
+        # self.q_optimizer = q_optimizer
         # TIQL
-        # self.critic = critic
+        self.critic = critic
         self.actor_optimizer = actor_optimizer
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, max_steps)
         self.iql_tau = iql_tau
@@ -462,29 +463,29 @@ class ImplicitQLearning:
         self.traj_length = None
 
 
-        # self.wd_critic = wd_critic
-        # self.lr_critic = lr_critic
-        # self.betas = betas
-        # self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
-        #     weight_decay=self.wd_critic, learning_rate=self.lr_critic,
-        #     betas=self.betas)
-        # self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
-        #
-        # if not self.critic.single_q:
-        #     self.critic_grad_scaler = [GradScaler(), GradScaler()]
-        # else:
-        #     self.critic_grad_scaler = [GradScaler()] * 2
-        #
-        # self.discount_factor = torch.tensor(float(0.99),
-        #                                     dtype=self.dtype,
-        #                                     device=self.device)
-        # self.use_mix_precision = use_mix_precision
-        # self.soft_target_update_rate = soft_target_update_rate
-        # self.target_update_period = target_update_period
-        # self.random_target = random_target
-        #
-        # self.log_now = False
-        # self.clip_grad_norm = 1.0
+        self.wd_critic = wd_critic
+        self.lr_critic = lr_critic
+        self.betas = betas
+        self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
+            weight_decay=self.wd_critic, learning_rate=self.lr_critic,
+            betas=self.betas)
+        self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
+        
+        if not self.critic.single_q:
+            self.critic_grad_scaler = [GradScaler(), GradScaler()]
+        else:
+            self.critic_grad_scaler = [GradScaler()] * 2
+        
+        self.discount_factor = torch.tensor(float(0.99),
+                                            dtype=self.dtype,
+                                            device=self.device)
+        self.use_mix_precision = use_mix_precision
+        self.soft_target_update_rate = soft_target_update_rate
+        self.target_update_period = target_update_period
+        self.random_target = random_target
+        
+        self.log_now = False
+        self.clip_grad_norm = 1.0
 
 
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
@@ -836,41 +837,6 @@ class ImplicitQLearning:
 
         return n_step_returns
 
-    def train(self, batch: TensorBatch) -> Dict[str, float]:
-        self.total_it += 1
-        (
-            observations_seq,
-            actions_seq,
-            rewards_seq,
-            next_observations_seq,
-            dones_seq,
-        ) = batch
-
-        step_batch = [item[:, 0] for item in batch]
-        (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
-        ) = step_batch
-
-        log_dict = {}
-
-        with torch.no_grad():
-            next_v = self.vf(next_observations)
-        # Update value function
-        adv = self._update_v(observations, actions, log_dict)
-
-        rewards = rewards.squeeze(dim=-1)
-        dones = dones.squeeze(dim=-1)
-        # Update Q function
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-        # Update actor
-        self._update_policy(adv, observations, actions, log_dict)
-
-        return log_dict
-
     # def train(self, batch: TensorBatch) -> Dict[str, float]:
     #     self.total_it += 1
     #     (
@@ -880,247 +846,284 @@ class ImplicitQLearning:
     #         next_observations_seq,
     #         dones_seq,
     #     ) = batch
-    #
-    #     rewards_seq = rewards_seq.squeeze(-1)
-    #
+
     #     step_batch = [item[:, 0] for item in batch]
     #     (
-    #         observations_step,
-    #         actions_step,
-    #         rewards_step,
-    #         next_observations_step,
-    #         dones_step,
+    #         observations,
+    #         actions,
+    #         rewards,
+    #         next_observations,
+    #         dones,
     #     ) = step_batch
-    #
+
     #     log_dict = {}
-    #
-    #     mse = torch.nn.MSELoss()
-    #     # util.run_time_test(lock=True, key="update critic")
-    #     self.critic.train()
-    #     self.critic.requires_grad(True)
-    #     # Initialize scalers for mixed precision
-    #     if self.use_mix_precision:
-    #         scaler_1 = torch.cuda.amp.GradScaler()
-    #         scaler_2 = torch.cuda.amp.GradScaler()
-    #     else:
-    #         scaler_1 = scaler_2 = None
-    #
-    #     # Use segment-based n-step return Q-learning
-    #     critic_loss_list = []
-    #     critic_grad_norm = []
-    #     clipped_critic_grad_norm = []
-    #
-    #     # Time logs for critic updates
-    #     update_critic_net_time = []
-    #     update_target_net_time = []
-    #
-    #     # Value estimation error log
-    #     mc_returns_list = []
-    #     targets_list = []
-    #     targets_bias_list = []
-    #
-    #     # targets = None
-    #     # vq_pred = None
-    #
-    #     # Generate segments using the reusable get_segments method
-    #     num_traj = observations_seq.shape[0]
-    #     traj_length = observations_seq.shape[1]
-    #
-    #     # Set traj_length for get_segments method
-    #     self.traj_length = traj_length
-    #
-    #     # Use segment-based n-step return Q-learning (similar to SeqQAgent)
-    #     idx_in_segments = self.get_segments(pad_additional=True)
-    #     seg_start_idx = idx_in_segments[..., 0]
-    #     assert seg_start_idx[-1] < self.traj_length
-    #     seg_actions_idx = idx_in_segments[..., :-1]
-    #     num_seg_actions = seg_actions_idx.shape[-1]
-    #
-    #     # [num_traj, num_segments, dim_state]
-    #     c_state = observations_seq[:, seg_start_idx]
-    #     seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
-    #
-    #     # for CQL step-based actor, c_state_seq [num_traj, num_segments, segments_length, dim_state]
-    #     seg_state_idx = idx_in_segments[..., :-1]
-    #     num_seg_state = seg_state_idx.shape[-1]
-    #     padded_states_c = torch.nn.functional.pad(
-    #         observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
-    #     padded_states_n = torch.nn.functional.pad(
-    #         next_observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
-    #
-    #     c_state_seq = padded_states_c[:, seg_state_idx]
-    #     n_state_seq = padded_states_n[:, seg_state_idx]
-    #     seg_state_idx = util.add_expand_dim(seg_state_idx, [0], [num_traj])
-    #
-    #     padded_actions = torch.nn.functional.pad(
-    #         actions_seq, (0, 0, 0, num_seg_actions), "constant", 0)
-    #
-    #     # [num_traj, num_segments, num_seg_actions, dim_action]
-    #     seg_actions = padded_actions[:, seg_actions_idx]
-    #
-    #     # [num_traj, num_segments, num_seg_actions]
-    #     seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
-    #                                           [num_traj])
-    #
-    #     targets = self.segments_n_step_return_implicit_vf(
-    #         observations_seq,
-    #         actions_seq,
-    #         next_observations_seq,
-    #         rewards_seq,
-    #         dones_seq,
-    #         idx_in_segments)
-    #
-    #     # Log targets and MC returns
-    #     # if self.log_now:
-    #     mc_returns_mean = util.compute_mc_return(
-    #         rewards_seq.mean(dim=0),
-    #         self.discount_factor).mean().item()
-    #
-    #     mc_returns_list.append(mc_returns_mean)
-    #     targets_mean = targets.mean().item()
-    #     targets_list.append(targets_mean)
-    #     targets_bias_list.append(targets_mean - mc_returns_mean)
-    #
-    #     log_dict.update(
-    #         dict(
-    #             mc_returns_mean=mc_returns_mean,
-    #             targets_mean=targets_mean,
-    #             targets_bias_mean=targets_mean - mc_returns_mean,
-    #         )
-    #     )
-    #
-    #     # qf_loss = 0.0
-    #
-    #     for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
-    #         # Use mix precision for faster computation
-    #         with util.autocast_if(self.use_mix_precision):
-    #             # [num_traj, num_segments, 1 + num_seg_actions]
-    #             vq_pred = self.critic.critic(
-    #                 net=net, d_state=None, c_state=c_state,
-    #                 actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
-    #                 idx_a=seg_actions_idx)
-    #
-    #             # Mask out the padded actions
-    #             # [num_traj, num_segments, num_seg_actions]
-    #             valid_mask = seg_actions_idx < self.traj_length
-    #
-    #             # [num_traj, num_segments, num_seg_actions]
-    #             vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
-    #             targets[..., 1:] = targets[..., 1:] * valid_mask
-    #
-    #             # Loss
-    #             q_diff = vq_pred[..., 1:] - targets[..., 1:]
-    #             q_sum = torch.sum(q_diff ** 2)
-    #             v_diff = vq_pred[..., 0] - targets[..., 0]
-    #             v_sum = torch.sum(v_diff ** 2)
-    #             critic_loss = mse(vq_pred[..., 1:], targets[..., 1:])
-    #             # print(vq_pred[..., 1:], targets[..., 1:], critic_loss, ((vq_pred[..., 1:]-targets[..., 1:])**2).mean())
-    #             # asymmetric_l2_loss is different from the lecture
-    #             # TODO: test and rewrite it as in the lecture
-    #             iql_loss = asymmetric_l2_loss(-v_diff, self.iql_tau)
-    #             critic_loss = critic_loss + iql_loss
-    #             # expectile loss for  V and mse for Q
-    #
-    #             qf1_value = vq_pred[..., 1] - targets[..., 1]
-    #
-    #             # qf_loss = qf_loss + critic_loss
-    #             # print("critic_loss", critic_loss.item())
-    #
-    #             log_dict.update(
-    #                 {
-    #                     f"{net_name}_1step_q_diff": qf1_value.mean().item(),
-    #                     f"{net_name}_1step_q": vq_pred[..., 1].mean().item(),
-    #                     f"{net_name}_q_mean": vq_pred[..., 1:].mean().item(),
-    #                     f"{net_name}_target_mean": targets[..., 1:].mean().item(),
-    #                     f"{net_name}_return_mean": mc_returns_mean,
-    #                     f"{net_name}_v": vq_pred[..., 0].mean().item(),
-    #                     f"{net_name}_q_loss": critic_loss.item(),
-    #                     f"{net_name}_iql_loss": iql_loss.item(),
-    #                 }
-    #             )
-    #
-    #         # Update critic net parameters
-    #         # util.run_time_test(lock=True, key="update critic net")
-    #         opt.zero_grad(set_to_none=True)
-    #
-    #         # critic_loss.backward()
-    #         scaler.scale(critic_loss).backward()
-    #
-    #         if self.clip_grad_norm > 0 or self.log_now:
-    #             grad_norm, grad_norm_c = util.grad_norm_clip(
-    #                 self.clip_grad_norm, net.parameters())
-    #         else:
-    #             grad_norm, grad_norm_c = 0., 0.
-    #
-    #         # opt.step()
-    #         scaler.step(opt)
-    #         scaler.update()
-    #
-    #         # update_critic_net_time.append(
-    #         #     util.run_time_test(lock=False,
-    #         #                        key="update critic net"))
-    #
-    #         # Logging
-    #         critic_loss_list.append(critic_loss.item())
-    #         critic_grad_norm.append(grad_norm)
-    #         clipped_critic_grad_norm.append(grad_norm_c)
-    #
-    #         # Update target network
-    #         # util.run_time_test(lock=True, key="copy critic net")
-    #         self.critic.update_target_net(net, target_net)
-    #         # update_target_net_time.append(
-    #         #     util.run_time_test(lock=False,
-    #         #                        key="copy critic net"))
-    #
-    #     # IQL policy update
-    #     self.critic.eval()  # disable dropout
-    #     self.critic.requires_grad(False)
+
     #     with torch.no_grad():
-    #         # online V predictions from both critics (average them to update policy)
-    #         v1_online = self.critic.critic(self.critic.net1,
-    #                                        d_state=None, c_state=c_state,
-    #                                        actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
-    #         if self.critic.single_q:
-    #             v_avg = v1_online
-    #         else:
-    #             v2_online = self.critic.critic(self.critic.net2,
-    #                                            d_state=None, c_state=c_state,
-    #                                            actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
-    #             v_avg = 0.5 * (v1_online + v2_online)
-    #
-    #     adv = (targets[..., 1] - v_avg).detach()
-    #     adv_np = adv.detach().cpu().numpy()
-    #     adv_p95 = np.percentile(adv_np, 95)
-    #     adv_std = adv_np.std()
-    #     adv_min = adv_np.min()
-    #     adv_max = adv_np.max()
-    #     log_dict.update({"1step_adv": adv.mean().item(),
-    #                      "adv_p95": float(adv_p95),
-    #                      "adv_std": float(adv_std),
-    #                      "adv_min": float(adv_min),
-    #                      "adv_max": float(adv_max),
-    #                      })  # should >0
-    #     action_start_idx = idx_in_segments[..., 0]
-    #     c_action = actions_seq[:, action_start_idx]
-    #     self._update_policy(adv, c_state, c_action, log_dict)
-    #
-    #     # if self.total_it % self.target_update_period == 0:
-    #     #     self.update_target_network(self.soft_target_update_rate)
-    #
+    #         next_v = self.vf(next_observations)
+    #     # Update value function
+    #     adv = self._update_v(observations, actions, log_dict)
+
+    #     rewards = rewards.squeeze(dim=-1)
+    #     dones = dones.squeeze(dim=-1)
+    #     # Update Q function
+    #     self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+    #     # Update actor
+    #     self._update_policy(adv, observations, actions, log_dict)
+
     #     return log_dict
-    #
-    #     # with torch.no_grad():
-    #     #     next_v = self.vf(next_observations)
-    #     # # Update value function
-    #     # adv = self._update_v(observations, actions, log_dict)
-    #     # rewards = rewards.squeeze(dim=-1)
-    #     # dones = dones.squeeze(dim=-1)
-    #     # # Update Q function
-    #     # self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-    #     # # Update actor
-    #     # self._update_policy(adv, observations, actions, log_dict)
-    #     #
-    #     # return log_dict
+
+    def train(self, batch: TensorBatch) -> Dict[str, float]:
+        self.total_it += 1
+        (
+            observations_seq,
+            actions_seq,
+            rewards_seq,
+            next_observations_seq,
+            dones_seq,
+        ) = batch
+    
+        rewards_seq = rewards_seq.squeeze(-1)
+    
+        step_batch = [item[:, 0] for item in batch]
+        (
+            observations_step,
+            actions_step,
+            rewards_step,
+            next_observations_step,
+            dones_step,
+        ) = step_batch
+    
+        log_dict = {}
+    
+        mse = torch.nn.MSELoss()
+        # util.run_time_test(lock=True, key="update critic")
+        self.critic.train()
+        self.critic.requires_grad(True)
+        # Initialize scalers for mixed precision
+        if self.use_mix_precision:
+            scaler_1 = torch.cuda.amp.GradScaler()
+            scaler_2 = torch.cuda.amp.GradScaler()
+        else:
+            scaler_1 = scaler_2 = None
+    
+        # Use segment-based n-step return Q-learning
+        critic_loss_list = []
+        critic_grad_norm = []
+        clipped_critic_grad_norm = []
+    
+        # Time logs for critic updates
+        update_critic_net_time = []
+        update_target_net_time = []
+    
+        # Value estimation error log
+        mc_returns_list = []
+        targets_list = []
+        targets_bias_list = []
+    
+        # targets = None
+        # vq_pred = None
+    
+        # Generate segments using the reusable get_segments method
+        num_traj = observations_seq.shape[0]
+        traj_length = observations_seq.shape[1]
+    
+        # Set traj_length for get_segments method
+        self.traj_length = traj_length
+    
+        # Use segment-based n-step return Q-learning (similar to SeqQAgent)
+        idx_in_segments = self.get_segments(pad_additional=True)
+        seg_start_idx = idx_in_segments[..., 0]
+        assert seg_start_idx[-1] < self.traj_length
+        seg_actions_idx = idx_in_segments[..., :-1]
+        num_seg_actions = seg_actions_idx.shape[-1]
+    
+        # [num_traj, num_segments, dim_state]
+        c_state = observations_seq[:, seg_start_idx]
+        seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
+    
+        # for CQL step-based actor, c_state_seq [num_traj, num_segments, segments_length, dim_state]
+        seg_state_idx = idx_in_segments[..., :-1]
+        num_seg_state = seg_state_idx.shape[-1]
+        padded_states_c = torch.nn.functional.pad(
+            observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
+        padded_states_n = torch.nn.functional.pad(
+            next_observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
+    
+        c_state_seq = padded_states_c[:, seg_state_idx]
+        n_state_seq = padded_states_n[:, seg_state_idx]
+        seg_state_idx = util.add_expand_dim(seg_state_idx, [0], [num_traj])
+    
+        padded_actions = torch.nn.functional.pad(
+            actions_seq, (0, 0, 0, num_seg_actions), "constant", 0)
+    
+        # [num_traj, num_segments, num_seg_actions, dim_action]
+        seg_actions = padded_actions[:, seg_actions_idx]
+    
+        # [num_traj, num_segments, num_seg_actions]
+        seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
+                                              [num_traj])
+    
+        targets = self.segments_n_step_return_implicit_vf(
+            observations_seq,
+            actions_seq,
+            next_observations_seq,
+            rewards_seq,
+            dones_seq,
+            idx_in_segments)
+    
+        # Log targets and MC returns
+        # if self.log_now:
+        mc_returns_mean = util.compute_mc_return(
+            rewards_seq.mean(dim=0),
+            self.discount_factor).mean().item()
+    
+        mc_returns_list.append(mc_returns_mean)
+        targets_mean = targets.mean().item()
+        targets_list.append(targets_mean)
+        targets_bias_list.append(targets_mean - mc_returns_mean)
+    
+        log_dict.update(
+            dict(
+                mc_returns_mean=mc_returns_mean,
+                targets_mean=targets_mean,
+                targets_bias_mean=targets_mean - mc_returns_mean,
+            )
+        )
+    
+        # qf_loss = 0.0
+    
+        for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
+            # Use mix precision for faster computation
+            with util.autocast_if(self.use_mix_precision):
+                # [num_traj, num_segments, 1 + num_seg_actions]
+                vq_pred = self.critic.critic(
+                    net=net, d_state=None, c_state=c_state,
+                    actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+                    idx_a=seg_actions_idx)
+    
+                # Mask out the padded actions
+                # [num_traj, num_segments, num_seg_actions]
+                valid_mask = seg_actions_idx < self.traj_length
+    
+                # [num_traj, num_segments, num_seg_actions]
+                vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
+                targets[..., 1:] = targets[..., 1:] * valid_mask
+    
+                # Loss
+                q_diff = vq_pred[..., 1:] - targets[..., 1:]
+                q_sum = torch.sum(q_diff ** 2)
+                # v_diff = vq_pred[..., 0] - targets[..., 0]
+                adv = targets[..., 0] - vq_pred[..., 0]
+                v_sum = torch.sum(adv ** 2)
+                critic_loss = mse(vq_pred[..., 1:], targets[..., 1:])
+                # print(vq_pred[..., 1:], targets[..., 1:], critic_loss, ((vq_pred[..., 1:]-targets[..., 1:])**2).mean())
+                # asymmetric_l2_loss is different from the lecture
+                # TODO: test and rewrite it as in the lecture
+                iql_loss = asymmetric_l2_loss(adv, self.iql_tau)
+                critic_loss = critic_loss + iql_loss
+                # expectile loss for  V and mse for Q
+    
+                qf1_value = vq_pred[..., 1] - targets[..., 1]
+    
+                # qf_loss = qf_loss + critic_loss
+                # print("critic_loss", critic_loss.item())
+    
+                log_dict.update(
+                    {
+                        f"{net_name}_1step_q_diff": qf1_value.mean().item(),
+                        f"{net_name}_1step_q": vq_pred[..., 1].mean().item(),
+                        f"{net_name}_q_mean": vq_pred[..., 1:].mean().item(),
+                        f"{net_name}_target_mean": targets[..., 1:].mean().item(),
+                        f"{net_name}_return_mean": mc_returns_mean,
+                        f"{net_name}_v": vq_pred[..., 0].mean().item(),
+                        f"{net_name}_adv": adv.mean().item(),
+                        f"{net_name}_q_loss": critic_loss.item(),
+                        f"{net_name}_iql_loss": iql_loss.item(),
+                    }
+                )
+    
+            # Update critic net parameters
+            # util.run_time_test(lock=True, key="update critic net")
+            opt.zero_grad(set_to_none=True)
+    
+            # critic_loss.backward()
+            scaler.scale(critic_loss).backward()
+    
+            if self.clip_grad_norm > 0 or self.log_now:
+                grad_norm, grad_norm_c = util.grad_norm_clip(
+                    self.clip_grad_norm, net.parameters())
+            else:
+                grad_norm, grad_norm_c = 0., 0.
+    
+            # opt.step()
+            scaler.step(opt)
+            scaler.update()
+    
+            # update_critic_net_time.append(
+            #     util.run_time_test(lock=False,
+            #                        key="update critic net"))
+    
+            # Logging
+            critic_loss_list.append(critic_loss.item())
+            critic_grad_norm.append(grad_norm)
+            clipped_critic_grad_norm.append(grad_norm_c)
+    
+            # Update target network
+            # util.run_time_test(lock=True, key="copy critic net")
+            self.critic.update_target_net(net, target_net)
+            # update_target_net_time.append(
+            #     util.run_time_test(lock=False,
+            #                        key="copy critic net"))
+    
+        # IQL policy update
+        self.critic.eval()  # disable dropout
+        self.critic.requires_grad(False)
+        with torch.no_grad():
+            # online V predictions from both critics (average them to update policy)
+            v1_online = self.critic.critic(self.critic.net1,
+                                           d_state=None, c_state=c_state,
+                                           actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+            if self.critic.single_q:
+                v_avg = v1_online
+            else:
+                v2_online = self.critic.critic(self.critic.net2,
+                                               d_state=None, c_state=c_state,
+                                               actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+                v_avg = 0.5 * (v1_online + v2_online)
+    
+        adv = (targets[..., 1] - v_avg).detach()
+        adv_np = adv.detach().cpu().numpy()
+        adv_p95 = np.percentile(adv_np, 95)
+        adv_std = adv_np.std()
+        adv_min = adv_np.min()
+        adv_max = adv_np.max()
+        log_dict.update({"1step_adv": adv.mean().item(),
+                         "adv_p95": float(adv_p95),
+                         "adv_std": float(adv_std),
+                         "adv_min": float(adv_min),
+                         "adv_max": float(adv_max),
+                         })  # should >0
+        action_start_idx = idx_in_segments[..., 0]
+        c_action = actions_seq[:, action_start_idx]
+        self._update_policy(adv, c_state, c_action, log_dict)
+    
+        # if self.total_it % self.target_update_period == 0:
+        #     self.update_target_network(self.soft_target_update_rate)
+    
+        return log_dict
+    
+        # with torch.no_grad():
+        #     next_v = self.vf(next_observations)
+        # # Update value function
+        # adv = self._update_v(observations, actions, log_dict)
+        # rewards = rewards.squeeze(dim=-1)
+        # dones = dones.squeeze(dim=-1)
+        # # Update Q function
+        # self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        # # Update actor
+        # self._update_policy(adv, observations, actions, log_dict)
+        #
+        # return log_dict
 
     def update_target_network(self, soft_target_update_rate: float):
         soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
@@ -1236,8 +1239,8 @@ def train(config: TrainConfig):
     seed = config.seed
     set_seed(seed, env)
 
-    q_network = TwinQ(state_dim, action_dim).to(config.device)
-    v_network = ValueFunction(state_dim).to(config.device)
+    # q_network = TwinQ(state_dim, action_dim).to(config.device)
+    # v_network = ValueFunction(state_dim).to(config.device)
     # actor = (
     #     DeterministicPolicy(
     #         state_dim, action_dim, max_action, dropout=config.actor_dropout
@@ -1247,28 +1250,28 @@ def train(config: TrainConfig):
     #         state_dim, action_dim, max_action, dropout=config.actor_dropout
     #     )
     # ).to(config.device)
-    v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
-    q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
+    # v_optimizer = torch.optim.Adam(v_network.parameters(), lr=config.vf_lr)
+    # q_optimizer = torch.optim.Adam(q_network.parameters(), lr=config.qf_lr)
     # actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_lr)
 
-    # critic_config = {
-    #     "state_dim": state_dim,
-    #     "action_dim": action_dim,
-    #     "single_q": False,
-    #     "device": config.device,
-    #     "dtype": "float32",
-    #     "bias": True,
-    #     "n_embd": 128,
-    #     "block_size": 1024,
-    #     "dropout": 0.0,
-    #     "n_layer": 2,
-    #     "n_head": 8,
-    #     "update_rate": 0.005,
-    #     "use_layer_norm": True,
-    #     "relative_pos": False
-    # }
-    #
-    # critic = seq_critic.SeqCritic(**critic_config)
+    critic_config = {
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "single_q": False,
+        "device": config.device,
+        "dtype": "float32",
+        "bias": True,
+        "n_embd": 128,
+        "block_size": 1024,
+        "dropout": 0.0,
+        "n_layer": 2,
+        "n_head": 8,
+        "update_rate": 0.005,
+        "use_layer_norm": True,
+        "relative_pos": False
+    }
+    
+    critic = seq_critic.SeqCritic(**critic_config)
 
     policy_kwargs = {
         "mean_net_args": {
@@ -1306,16 +1309,16 @@ def train(config: TrainConfig):
         "max_action": max_action,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
-        # standard IQL
-        "q_network": q_network,
-        "q_optimizer": q_optimizer,
-        "v_network": v_network,
-        "v_optimizer": v_optimizer,
+        # # standard IQL
+        # "q_network": q_network,
+        # "q_optimizer": q_optimizer,
+        # "v_network": v_network,
+        # "v_optimizer": v_optimizer,
         "discount": config.discount,
         "tau": config.tau,
         "device": config.device,
         # IQL
-        # "critic": critic,
+        "critic": critic,
         "beta": config.beta,
         "iql_tau": config.iql_tau,
         "max_steps": config.max_timesteps,
