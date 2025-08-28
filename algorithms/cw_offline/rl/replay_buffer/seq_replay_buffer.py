@@ -66,7 +66,7 @@ class SeqReplayBuffer:
                 "Policy recent factor not supported with priority"
         self.policy_scope = int(self.buffer_size * policy_scope_factor)
 
-        self.sequence_length = kwargs.get("sequence_length", 25) # check step based critic
+        self.sequence_length = kwargs.get("sequence_length", 1) # check step based critic
 
     @torch.no_grad()
     def add(self, dataset_dict: dict):

@@ -26,7 +26,6 @@ import algorithms.cw_offline.rl.critic.seq_critic as seq_critic
 
 from torch.cuda.amp import GradScaler
 
-
 TensorBatch = List[torch.Tensor]
 
 
@@ -46,7 +45,7 @@ class TrainConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     # discount factor
-    discount: float = 1.0 # 0.99
+    discount: float = 1.0  # 0.99
     # coefficient for the target critic Polyak's update
     tau: float = 0.005
     # actor update inverse temperature, similar to AWAC
@@ -63,7 +62,7 @@ class TrainConfig:
     # maximum size of the replay buffer
     buffer_size: int = 2_000_000
     # training batch size
-    batch_size: int = 256
+    batch_size: int = 1024
     # whether to normalize states
     normalize: bool = True
     # whether to normalize reward (like in IQL)
@@ -87,9 +86,13 @@ class TrainConfig:
     # training random seed
     seed: int = 0
     # training device
-    device: str = "cuda"
+    device: str = "cuda:1"
+
+    lr_critic: float = 3e-4
 
     policy_lr: float = 3e-4
+
+    random_target: bool = False
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -413,7 +416,7 @@ class ImplicitQLearning:
         max_action: float,
         actor: nn.Module,
         actor_optimizer: torch.optim.Optimizer,
-        # standard iql
+        # # standard iql
         # q_network: nn.Module,
         # q_optimizer: torch.optim.Optimizer,
         # v_network: nn.Module,
@@ -438,7 +441,7 @@ class ImplicitQLearning:
     ):
         self.max_action = max_action
         self.actor = actor
-        # standard iql
+        # # standard iql
         # self.qf = q_network
         # self.q_target = copy.deepcopy(self.qf).requires_grad_(False).to(device)
         # self.vf = v_network
@@ -458,7 +461,7 @@ class ImplicitQLearning:
 
         # added for TIQL
         self.dtype = dtype
-        self.num_segments = 5
+        self.num_segments = 1
         # Initialize traj_length (will be set during training)
         self.traj_length = None
 
@@ -470,20 +473,20 @@ class ImplicitQLearning:
             weight_decay=self.wd_critic, learning_rate=self.lr_critic,
             betas=self.betas)
         self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
-        
+
         if not self.critic.single_q:
             self.critic_grad_scaler = [GradScaler(), GradScaler()]
         else:
             self.critic_grad_scaler = [GradScaler()] * 2
-        
-        self.discount_factor = torch.tensor(float(0.99),
+
+        self.discount_factor = torch.tensor(self.discount,
                                             dtype=self.dtype,
                                             device=self.device)
         self.use_mix_precision = use_mix_precision
         self.soft_target_update_rate = soft_target_update_rate
         self.target_update_period = target_update_period
         self.random_target = random_target
-        
+
         self.log_now = False
         self.clip_grad_norm = 1.0
 
@@ -497,8 +500,9 @@ class ImplicitQLearning:
         adv = target_q - v
         v_loss = asymmetric_l2_loss(adv, self.iql_tau)
         log_dict["net1_iql_loss"] = v_loss.item()
-        log_dict["1step_adv"] = adv.mean().item()
+        log_dict["net1_adv"] = adv.mean().item()
         log_dict["net1_v"] = v.mean().item()
+        log_dict[f"net1_v_target(q)_mean"] = target_q.mean().item()
         self.v_optimizer.zero_grad()
         v_loss.backward()
         self.v_optimizer.step()
@@ -521,7 +525,7 @@ class ImplicitQLearning:
         for i, q in enumerate(qs, start=1):
             log_dict[f"net{i}_q_loss"] = q_loss.item()
             log_dict[f"net{i}_q_mean"] = q.mean().item()
-            log_dict[f"net{i}_target_mean"] = targets.mean().item()
+            log_dict[f"net{i}_q_target(r+v)_mean"] = targets.mean().item()
         self.q_optimizer.zero_grad()
         q_loss.backward()
         self.q_optimizer.step()
@@ -846,7 +850,7 @@ class ImplicitQLearning:
     #         next_observations_seq,
     #         dones_seq,
     #     ) = batch
-
+    #
     #     step_batch = [item[:, 0] for item in batch]
     #     (
     #         observations,
@@ -855,21 +859,21 @@ class ImplicitQLearning:
     #         next_observations,
     #         dones,
     #     ) = step_batch
-
+    #
     #     log_dict = {}
-
+    #
     #     with torch.no_grad():
     #         next_v = self.vf(next_observations)
     #     # Update value function
     #     adv = self._update_v(observations, actions, log_dict)
-
+    #
     #     rewards = rewards.squeeze(dim=-1)
     #     dones = dones.squeeze(dim=-1)
     #     # Update Q function
     #     self._update_q(next_v, observations, actions, rewards, dones, log_dict)
     #     # Update actor
     #     self._update_policy(adv, observations, actions, log_dict)
-
+    #
     #     return log_dict
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
@@ -881,9 +885,9 @@ class ImplicitQLearning:
             next_observations_seq,
             dones_seq,
         ) = batch
-    
+
         rewards_seq = rewards_seq.squeeze(-1)
-    
+
         step_batch = [item[:, 0] for item in batch]
         (
             observations_step,
@@ -892,9 +896,9 @@ class ImplicitQLearning:
             next_observations_step,
             dones_step,
         ) = step_batch
-    
+
         log_dict = {}
-    
+
         mse = torch.nn.MSELoss()
         # util.run_time_test(lock=True, key="update critic")
         self.critic.train()
@@ -905,42 +909,42 @@ class ImplicitQLearning:
             scaler_2 = torch.cuda.amp.GradScaler()
         else:
             scaler_1 = scaler_2 = None
-    
+
         # Use segment-based n-step return Q-learning
         critic_loss_list = []
         critic_grad_norm = []
         clipped_critic_grad_norm = []
-    
+
         # Time logs for critic updates
         update_critic_net_time = []
         update_target_net_time = []
-    
+
         # Value estimation error log
         mc_returns_list = []
         targets_list = []
         targets_bias_list = []
-    
+
         # targets = None
         # vq_pred = None
-    
+
         # Generate segments using the reusable get_segments method
         num_traj = observations_seq.shape[0]
         traj_length = observations_seq.shape[1]
-    
+
         # Set traj_length for get_segments method
         self.traj_length = traj_length
-    
+
         # Use segment-based n-step return Q-learning (similar to SeqQAgent)
         idx_in_segments = self.get_segments(pad_additional=True)
         seg_start_idx = idx_in_segments[..., 0]
         assert seg_start_idx[-1] < self.traj_length
         seg_actions_idx = idx_in_segments[..., :-1]
         num_seg_actions = seg_actions_idx.shape[-1]
-    
+
         # [num_traj, num_segments, dim_state]
         c_state = observations_seq[:, seg_start_idx]
         seg_start_idx = util.add_expand_dim(seg_start_idx, [0], [num_traj])
-    
+
         # for CQL step-based actor, c_state_seq [num_traj, num_segments, segments_length, dim_state]
         seg_state_idx = idx_in_segments[..., :-1]
         num_seg_state = seg_state_idx.shape[-1]
@@ -948,21 +952,21 @@ class ImplicitQLearning:
             observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
         padded_states_n = torch.nn.functional.pad(
             next_observations_seq, (0, 0, 0, num_seg_state), "constant", 0)
-    
+
         c_state_seq = padded_states_c[:, seg_state_idx]
         n_state_seq = padded_states_n[:, seg_state_idx]
         seg_state_idx = util.add_expand_dim(seg_state_idx, [0], [num_traj])
-    
+
         padded_actions = torch.nn.functional.pad(
             actions_seq, (0, 0, 0, num_seg_actions), "constant", 0)
-    
+
         # [num_traj, num_segments, num_seg_actions, dim_action]
         seg_actions = padded_actions[:, seg_actions_idx]
-    
+
         # [num_traj, num_segments, num_seg_actions]
         seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
                                               [num_traj])
-    
+
         targets = self.segments_n_step_return_implicit_vf(
             observations_seq,
             actions_seq,
@@ -970,18 +974,18 @@ class ImplicitQLearning:
             rewards_seq,
             dones_seq,
             idx_in_segments)
-    
+
         # Log targets and MC returns
         # if self.log_now:
         mc_returns_mean = util.compute_mc_return(
             rewards_seq.mean(dim=0),
             self.discount_factor).mean().item()
-    
+
         mc_returns_list.append(mc_returns_mean)
         targets_mean = targets.mean().item()
         targets_list.append(targets_mean)
         targets_bias_list.append(targets_mean - mc_returns_mean)
-    
+
         log_dict.update(
             dict(
                 mc_returns_mean=mc_returns_mean,
@@ -989,9 +993,9 @@ class ImplicitQLearning:
                 targets_bias_mean=targets_mean - mc_returns_mean,
             )
         )
-    
+
         # qf_loss = 0.0
-    
+
         for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
             # Use mix precision for faster computation
             with util.autocast_if(self.use_mix_precision):
@@ -1000,15 +1004,15 @@ class ImplicitQLearning:
                     net=net, d_state=None, c_state=c_state,
                     actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
                     idx_a=seg_actions_idx)
-    
+
                 # Mask out the padded actions
                 # [num_traj, num_segments, num_seg_actions]
                 valid_mask = seg_actions_idx < self.traj_length
-    
+
                 # [num_traj, num_segments, num_seg_actions]
                 vq_pred[..., 1:] = vq_pred[..., 1:] * valid_mask
                 targets[..., 1:] = targets[..., 1:] * valid_mask
-    
+
                 # Loss
                 q_diff = vq_pred[..., 1:] - targets[..., 1:]
                 q_sum = torch.sum(q_diff ** 2)
@@ -1022,59 +1026,60 @@ class ImplicitQLearning:
                 iql_loss = asymmetric_l2_loss(adv, self.iql_tau)
                 critic_loss = critic_loss + iql_loss
                 # expectile loss for  V and mse for Q
-    
+
                 qf1_value = vq_pred[..., 1] - targets[..., 1]
-    
+
                 # qf_loss = qf_loss + critic_loss
                 # print("critic_loss", critic_loss.item())
-    
+
                 log_dict.update(
                     {
                         f"{net_name}_1step_q_diff": qf1_value.mean().item(),
                         f"{net_name}_1step_q": vq_pred[..., 1].mean().item(),
                         f"{net_name}_q_mean": vq_pred[..., 1:].mean().item(),
-                        f"{net_name}_target_mean": targets[..., 1:].mean().item(),
+                        f"{net_name}_q_target(r+v)_mean": targets[..., 1:].mean().item(),
                         f"{net_name}_return_mean": mc_returns_mean,
                         f"{net_name}_v": vq_pred[..., 0].mean().item(),
+                        f"{net_name}_v_target(q)_mean": targets[..., 0].mean().item(),
                         f"{net_name}_adv": adv.mean().item(),
                         f"{net_name}_q_loss": critic_loss.item(),
                         f"{net_name}_iql_loss": iql_loss.item(),
                     }
                 )
-    
+
             # Update critic net parameters
             # util.run_time_test(lock=True, key="update critic net")
             opt.zero_grad(set_to_none=True)
-    
+
             # critic_loss.backward()
             scaler.scale(critic_loss).backward()
-    
+
             if self.clip_grad_norm > 0 or self.log_now:
                 grad_norm, grad_norm_c = util.grad_norm_clip(
                     self.clip_grad_norm, net.parameters())
             else:
                 grad_norm, grad_norm_c = 0., 0.
-    
+
             # opt.step()
             scaler.step(opt)
             scaler.update()
-    
+
             # update_critic_net_time.append(
             #     util.run_time_test(lock=False,
             #                        key="update critic net"))
-    
+
             # Logging
             critic_loss_list.append(critic_loss.item())
             critic_grad_norm.append(grad_norm)
             clipped_critic_grad_norm.append(grad_norm_c)
-    
+
             # Update target network
             # util.run_time_test(lock=True, key="copy critic net")
             self.critic.update_target_net(net, target_net)
             # update_target_net_time.append(
             #     util.run_time_test(lock=False,
             #                        key="copy critic net"))
-    
+
         # IQL policy update
         self.critic.eval()  # disable dropout
         self.critic.requires_grad(False)
@@ -1090,7 +1095,13 @@ class ImplicitQLearning:
                                                d_state=None, c_state=c_state,
                                                actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
                 v_avg = 0.5 * (v1_online + v2_online)
-    
+
+        log_dict.update(
+            {
+                "pure_v_pred_avg": v_avg.mean().item(),
+            }
+        )
+
         adv = (targets[..., 1] - v_avg).detach()
         adv_np = adv.detach().cpu().numpy()
         adv_p95 = np.percentile(adv_np, 95)
@@ -1106,12 +1117,12 @@ class ImplicitQLearning:
         action_start_idx = idx_in_segments[..., 0]
         c_action = actions_seq[:, action_start_idx]
         self._update_policy(adv, c_state, c_action, log_dict)
-    
+
         # if self.total_it % self.target_update_period == 0:
         #     self.update_target_network(self.soft_target_update_rate)
-    
+
         return log_dict
-    
+
         # with torch.no_grad():
         #     next_v = self.vf(next_observations)
         # # Update value function
@@ -1270,7 +1281,7 @@ def train(config: TrainConfig):
         "use_layer_norm": True,
         "relative_pos": False
     }
-    
+
     critic = seq_critic.SeqCritic(**critic_config)
 
     policy_kwargs = {
@@ -1322,7 +1333,9 @@ def train(config: TrainConfig):
         "beta": config.beta,
         "iql_tau": config.iql_tau,
         "max_steps": config.max_timesteps,
+        "lr_critic": config.lr_critic,
         # TIQL
+        "random_target": config.random_target,
     }
 
     print("---------------------------------------")
