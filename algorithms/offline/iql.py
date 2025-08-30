@@ -775,7 +775,10 @@ class ImplicitQLearning:
         # future_returns[future_returns != 0] = 100
 
         # if terminated, V should not be added to r+gamma*V, and truncated is already realized by set following seq as 0
-        future_returns[..., 1:] = (1-dones)*future_returns[..., 1:]
+        dones_pad_zero_end \
+            = torch.nn.functional.pad(dones.squeeze(-1), (0, num_seg_actions))
+        d_seq = dones_pad_zero_end[:, idx_in_segments[:, :-1]]
+        future_returns[..., 1:] = (1-d_seq)*future_returns[..., 1:]
 
         ################ Compute the reward in the future ##################
         # [num_traj, traj_length] -> [num_traj, traj_length + padding]
@@ -1369,8 +1372,8 @@ def train(config: TrainConfig):
         # batch = [b.to(config.device) for b in batch]
 
         batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False)
-        if batch_seq["truncated"].any().item():
-            print("batch contains truncated!")
+        # if batch_seq["truncated"].any().item():
+        #     print("batch contains truncated!")
         batch_seq = convert_batch_dict_to_list(batch_seq)
         batch_seq = [b.to(config.device) for b in batch_seq]
 
