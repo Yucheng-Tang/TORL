@@ -45,7 +45,7 @@ class TrainConfig:
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     # discount factor
-    discount: float = 1.0  # 0.99
+    discount: float = 0.99  # 0.99
     # coefficient for the target critic Polyak's update
     tau: float = 0.005
     # actor update inverse temperature, similar to AWAC
@@ -62,7 +62,7 @@ class TrainConfig:
     # maximum size of the replay buffer
     buffer_size: int = 2_000_000
     # training batch size
-    batch_size: int = 1024
+    batch_size: int = 256
     # whether to normalize states
     normalize: bool = True
     # whether to normalize reward (like in IQL)
@@ -93,6 +93,8 @@ class TrainConfig:
     policy_lr: float = 3e-4
 
     random_target: bool = False
+
+    clip_grad_norm: float = 0.0
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -438,6 +440,7 @@ class ImplicitQLearning:
         soft_target_update_rate: float = 5e-3,
         target_update_period: int = 1,
         random_target: bool = True,
+        clip_grad_norm : float = 1.0,
     ):
         self.max_action = max_action
         self.actor = actor
@@ -488,7 +491,7 @@ class ImplicitQLearning:
         self.random_target = random_target
 
         self.log_now = False
-        self.clip_grad_norm = 1.0
+        self.clip_grad_norm = clip_grad_norm
 
 
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
@@ -734,12 +737,12 @@ class ImplicitQLearning:
         # Use mix precision for faster computation
         with util.autocast_if(self.use_mix_precision):
             # [num_traj, traj_length]
-            future_v1 = self.critic.critic(self.critic.target_net1,
+            future_v1 = self.critic.critic(self.critic.net1,
                                            d_state=None, c_state=n_state,
                                            actions=None, idx_d=None,
                                            idx_c=c_idx, idx_a=None).squeeze(-1)
             if not self.critic.single_q:
-                future_v2 = self.critic.critic(self.critic.target_net2,
+                future_v2 = self.critic.critic(self.critic.net2,
                                                d_state=None, c_state=n_state,
                                                actions=None, idx_d=None,
                                                idx_c=c_idx, idx_a=None).squeeze(-1)
@@ -753,6 +756,8 @@ class ImplicitQLearning:
             future_v = future_v1 * mask + future_v2 * (1 - mask)
         else:
             future_v = torch.minimum(future_v1, future_v2)
+
+        future_v = future_v.detach()
 
         # Pad zeros to the states which go beyond the traj length
         future_v_pad_zero_end \
@@ -841,40 +846,40 @@ class ImplicitQLearning:
 
         return n_step_returns
 
-    # def train(self, batch: TensorBatch) -> Dict[str, float]:
-    #     self.total_it += 1
-    #     (
-    #         observations_seq,
-    #         actions_seq,
-    #         rewards_seq,
-    #         next_observations_seq,
-    #         dones_seq,
-    #     ) = batch
-    #
-    #     step_batch = [item[:, 0] for item in batch]
-    #     (
-    #         observations,
-    #         actions,
-    #         rewards,
-    #         next_observations,
-    #         dones,
-    #     ) = step_batch
-    #
-    #     log_dict = {}
-    #
-    #     with torch.no_grad():
-    #         next_v = self.vf(next_observations)
-    #     # Update value function
-    #     adv = self._update_v(observations, actions, log_dict)
-    #
-    #     rewards = rewards.squeeze(dim=-1)
-    #     dones = dones.squeeze(dim=-1)
-    #     # Update Q function
-    #     self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-    #     # Update actor
-    #     self._update_policy(adv, observations, actions, log_dict)
-    #
-    #     return log_dict
+    def train(self, batch: TensorBatch) -> Dict[str, float]:
+        self.total_it += 1
+        (
+            observations_seq,
+            actions_seq,
+            rewards_seq,
+            next_observations_seq,
+            dones_seq,
+        ) = batch
+
+        step_batch = [item[:, 0] for item in batch]
+        (
+            observations,
+            actions,
+            rewards,
+            next_observations,
+            dones,
+        ) = step_batch
+
+        log_dict = {}
+
+        with torch.no_grad():
+            next_v = self.vf(next_observations)
+        # Update value function
+        adv = self._update_v(observations, actions, log_dict)
+
+        rewards = rewards.squeeze(dim=-1)
+        dones = dones.squeeze(dim=-1)
+        # Update Q function
+        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+        # Update actor
+        self._update_policy(adv, observations, actions, log_dict)
+
+        return log_dict
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
@@ -1070,8 +1075,8 @@ class ImplicitQLearning:
 
             # Logging
             critic_loss_list.append(critic_loss.item())
-            critic_grad_norm.append(grad_norm)
-            clipped_critic_grad_norm.append(grad_norm_c)
+            # critic_grad_norm.append(grad_norm)
+            # clipped_critic_grad_norm.append(grad_norm_c)
 
             # Update target network
             # util.run_time_test(lock=True, key="copy critic net")
@@ -1336,6 +1341,7 @@ def train(config: TrainConfig):
         "lr_critic": config.lr_critic,
         # TIQL
         "random_target": config.random_target,
+        "clip_grad_norm": config.clip_grad_norm,
     }
 
     print("---------------------------------------")
