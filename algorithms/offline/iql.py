@@ -465,7 +465,7 @@ class ImplicitQLearning:
 
         # added for TIQL
         self.dtype = dtype
-        self.num_segments = 1
+        self.num_segments = 5
         # Initialize traj_length (will be set during training)
         self.traj_length = None
 
@@ -1099,14 +1099,28 @@ class ImplicitQLearning:
             # online V predictions from both critics (average them to update policy)
             v1_online = self.critic.critic(self.critic.net1,
                                            d_state=None, c_state=c_state,
-                                           actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
+                                           actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[:, 0]
             if self.critic.single_q:
                 v_avg = v1_online
             else:
                 v2_online = self.critic.critic(self.critic.net2,
                                                d_state=None, c_state=c_state,
-                                               actions=None, idx_d=None, idx_c=seg_start_idx, idx_a=None)[:, 0]
-                v_avg = 0.5 * (v1_online + v2_online)
+                                               actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[:, 0]
+                # v_avg = 0.5 * (v1_online + v2_online)
+                v_avg = torch.minimum(v1_online, v2_online)
+            q1_target = self.critic.critic(self.critic.target_net1,
+                                           d_state=None, c_state=c_state,
+                                           actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+                                           idx_a=seg_actions_idx)[:, 1]
+            if self.critic.single_q:
+                q_target_avg = q1_target
+            else:
+                q2_target = self.critic.critic(self.critic.target_net2,
+                                               d_state=None, c_state=c_state,
+                                               actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+                                               idx_a=seg_actions_idx)[:, 1]
+                # q_target_avg = 0.5 * (q1_target + q2_target)
+                q_target_avg = torch.minimum(q1_target, q2_target)
 
         log_dict.update(
             {
@@ -1114,7 +1128,9 @@ class ImplicitQLearning:
             }
         )
 
-        adv = (targets[..., 1] - v_avg).detach()
+        # TODO: check the policy update
+        # adv = (targets[..., 1] - v_avg).detach()
+        adv = (q_target_avg - v_avg).detach()
         adv_np = adv.detach().cpu().numpy()
         adv_p95 = np.percentile(adv_np, 95)
         adv_std = adv_np.std()
