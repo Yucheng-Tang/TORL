@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from typing import Dict
 
+from conda.base.context import env_name
+
 from algorithms.cw_offline import util
 
 
@@ -15,6 +17,7 @@ class SeqReplayBuffer:
                  priority_norm: bool = False,
                  dtype="float32", device='cuda',
                  **kwargs):
+        self.env_name = kwargs.get("env_name", "halfcheetah")
         self.buffer_size: int = buffer_size
         self.dtype, self.device = util.parse_dtype_device(dtype, device)
         self._ptr = 0
@@ -44,6 +47,12 @@ class SeqReplayBuffer:
             self.replay_buffer[data_name] = buffer
             self.random_data_name = data_name
 
+        # add truncated into the dataset
+        if any(s in self.env_name for s in ("halfcheetah")):
+            buffer = torch.zeros((buffer_size, *(1,)),
+                                 dtype=torch.bool, device=self.device)
+            self.replay_buffer["truncated"] = buffer
+
         self.has_priority = use_priority
 
         if self.has_priority:
@@ -66,7 +75,7 @@ class SeqReplayBuffer:
                 "Policy recent factor not supported with priority"
         self.policy_scope = int(self.buffer_size * policy_scope_factor)
 
-        self.sequence_length = kwargs.get("sequence_length", 1) # check step based critic
+        self.sequence_length = kwargs.get("sequence_length", 20) # check step based critic
 
     @torch.no_grad()
     def add(self, dataset_dict: dict):
@@ -175,10 +184,35 @@ class SeqReplayBuffer:
         smp_dict = dict()
 
         terminal_key = next((k for k in self.replay_buffer if "done" in k or "dones" in k or "terminals" in k), None)
+        # or "truncated" in k
         terminals_tensor = self.replay_buffer[terminal_key] if terminal_key else None
+
+        # add truncated into the dataset
+        # if any(s in self.env_name for s in ("halfcheetah")):
+        truncated_key = next((k for k in self.replay_buffer if "truncated" in k),
+                            None)
+        truncated_tensor = self.replay_buffer[truncated_key] if truncated_key else None
+            # for data_name, data_buffer in self.replay_buffer.items():
+            #     is_truncated_tag = data_name == truncated_key
+            #     for b in range(batch_size):
+            #         start = idx[b].item()
+            #         end = min(start + self.sequence_length, self._size)
+            #         valid_len = end - start
+            #         if not is_truncated_tag and truncated_key is not None:
+            #             done_window = torch.ones(self.sequence_length, dtype=torch.bool, device=self.device)
+            #             done_window[:valid_len] = self.replay_buffer[truncated_key][start:end].view(-1)
+            #
+            #             done_indices = (done_window > 0).nonzero(as_tuple=True)[0]
+            #             if len(done_indices) > 0:
+            #                 first_done = done_indices[0].item()
+            #                 zero_start = first_done + 1
+            #                 if zero_start < self.sequence_length:
+            #                     seq_batch[b, zero_start:] = 0
+
 
         for data_name, data_buffer in self.replay_buffer.items():
             is_terminal_tag = data_name == terminal_key
+            is_truncated_tag = data_name == truncated_key
             d = data_buffer.shape[1:]  # trailing dims
             seq_list = []
 
@@ -197,6 +231,16 @@ class SeqReplayBuffer:
                 if not is_terminal_tag and terminal_key is not None:
                     done_window = torch.ones(self.sequence_length, dtype=torch.bool, device=self.device)
                     done_window[:valid_len] = self.replay_buffer[terminal_key][start:end].view(-1)
+
+                    done_indices = (done_window > 0).nonzero(as_tuple=True)[0]
+                    if len(done_indices) > 0:
+                        first_done = done_indices[0].item()
+                        zero_start = first_done + 1
+                        if zero_start < self.sequence_length:
+                            seq_batch[b, zero_start:] = 0
+                if not is_truncated_tag and truncated_key is not None:
+                    done_window = torch.ones(self.sequence_length, dtype=torch.bool, device=self.device)
+                    done_window[:valid_len] = self.replay_buffer[truncated_key][start:end].view(-1)
 
                     done_indices = (done_window > 0).nonzero(as_tuple=True)[0]
                     if len(done_indices) > 0:
@@ -260,6 +304,7 @@ class SeqReplayBuffer:
             raise ValueError("Replay buffer is smaller than the dataset")
 
         torch_data = {}
+
         for name, shape in self.data_info.items():
             np_array = data[name]
 
@@ -313,6 +358,17 @@ class SeqReplayBuffer:
             else:
                 dtype = torch.float32
             torch_data[name] = torch.tensor(np_array, dtype=dtype, device=self.device)
+
+        # add truncated flag: True at 999*x-1 for Halfcheetah
+        if any(s in self.env_name for s in ("halfcheetah")):
+            idx = torch.arange(n, device=self.device)
+            truncated = ((idx + 1) % 999 == 0)
+            # add to the dataset dict
+            # [buffer_size, data_dim]
+            torch_data["truncated"] = truncated.unsqueeze(-1)
+            self.data_info["truncated"] = (1,)
+            self.data_norm_info["truncated"] = False
+
 
         self.add(torch_data)
         print(f"Dataset size: {n}")

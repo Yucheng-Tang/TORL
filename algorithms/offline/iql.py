@@ -2,6 +2,7 @@
 # https://arxiv.org/pdf/2110.06169.pdf
 import copy
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-71e5c35b-9eb6-a2a6-9b30-2e108de6212d,GPU-0073f373-55c9-4d6d-7621-ff5615e5f42d"
 import random
 import uuid
 from dataclasses import asdict, dataclass
@@ -86,7 +87,7 @@ class TrainConfig:
     # training random seed
     seed: int = 0
     # training device
-    device: str = "cuda:1"
+    device: str = "cuda"
 
     lr_critic: float = 3e-4
 
@@ -618,6 +619,7 @@ class ImplicitQLearning:
             next_observations: torch.Tensor,
             rewards: torch.Tensor,
             dones: torch.Tensor,
+            # truncated: torch.Tensor,
             idx_in_segments: torch.Tensor,):
         """
         Segment-wise n-step return using Value function
@@ -772,6 +774,8 @@ class ImplicitQLearning:
         # for test using Q all equal 100
         # future_returns[future_returns != 0] = 100
 
+        # if terminated, V should not be added to r+gamma*V, and truncated is already realized by set following seq as 0
+        future_returns[..., 1:] = (1-dones)*future_returns[..., 1:]
 
         ################ Compute the reward in the future ##################
         # [num_traj, traj_length] -> [num_traj, traj_length + padding]
@@ -846,40 +850,40 @@ class ImplicitQLearning:
 
         return n_step_returns
 
-    def train(self, batch: TensorBatch) -> Dict[str, float]:
-        self.total_it += 1
-        (
-            observations_seq,
-            actions_seq,
-            rewards_seq,
-            next_observations_seq,
-            dones_seq,
-        ) = batch
-
-        step_batch = [item[:, 0] for item in batch]
-        (
-            observations,
-            actions,
-            rewards,
-            next_observations,
-            dones,
-        ) = step_batch
-
-        log_dict = {}
-
-        with torch.no_grad():
-            next_v = self.vf(next_observations)
-        # Update value function
-        adv = self._update_v(observations, actions, log_dict)
-
-        rewards = rewards.squeeze(dim=-1)
-        dones = dones.squeeze(dim=-1)
-        # Update Q function
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-        # Update actor
-        self._update_policy(adv, observations, actions, log_dict)
-
-        return log_dict
+    # def train(self, batch: TensorBatch) -> Dict[str, float]:
+    #     self.total_it += 1
+    #     (
+    #         observations_seq,
+    #         actions_seq,
+    #         rewards_seq,
+    #         next_observations_seq,
+    #         dones_seq,
+    #     ) = batch
+    #
+    #     step_batch = [item[:, 0] for item in batch]
+    #     (
+    #         observations,
+    #         actions,
+    #         rewards,
+    #         next_observations,
+    #         dones,
+    #     ) = step_batch
+    #
+    #     log_dict = {}
+    #
+    #     with torch.no_grad():
+    #         next_v = self.vf(next_observations)
+    #     # Update value function
+    #     adv = self._update_v(observations, actions, log_dict)
+    #
+    #     rewards = rewards.squeeze(dim=-1)
+    #     dones = dones.squeeze(dim=-1)
+    #     # Update Q function
+    #     self._update_q(next_v, observations, actions, rewards, dones, log_dict)
+    #     # Update actor
+    #     self._update_policy(adv, observations, actions, log_dict)
+    #
+    #     return log_dict
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
@@ -1237,6 +1241,7 @@ def train(config: TrainConfig):
         replay_buffer_norm_info,
         config.buffer_size,
         device=config.device,
+        env_name = config.env,
     )
 
     replay_buffer_modular_seq.load_d4rl_dataset(dataset)
@@ -1364,6 +1369,8 @@ def train(config: TrainConfig):
         # batch = [b.to(config.device) for b in batch]
 
         batch_seq = replay_buffer_modular_seq.sample(config.batch_size, normalize=False)
+        if batch_seq["truncated"].any().item():
+            print("batch contains truncated!")
         batch_seq = convert_batch_dict_to_list(batch_seq)
         batch_seq = [b.to(config.device) for b in batch_seq]
 
@@ -1404,7 +1411,7 @@ def convert_batch_dict_to_list(batch: dict) -> List[torch.Tensor]:
         batch["actions"],
         batch["rewards"],
         batch["next_observations"],
-        batch["terminals"].float()  # make sure it's float if it's bool
+        batch["terminals"].float(),  # make sure it's float if it's bool
     ]
 
 
