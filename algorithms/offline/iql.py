@@ -1067,7 +1067,7 @@ class ImplicitQLearning:
                     }
                 )
 
-                if not current_v:
+                if current_v is None:
                     current_v = vq_pred[..., 0]
                 else:
                     current_v = torch.minimum(current_v, vq_pred[..., 0])
