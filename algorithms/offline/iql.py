@@ -1138,13 +1138,13 @@ class ImplicitQLearning:
 
         log_dict.update(
             {
-                "pure_v_pred_avg": v_avg.mean().item(),
+                "pure_v_pred_avg": current_v.mean().item(),
             }
         )
 
         # TODO: check the policy update
         # adv = (targets[..., 1] - v_avg).detach()
-        adv = (step_q_target - v_avg).detach()
+        adv = (step_q_target - current_v).detach()
         adv_np = adv.detach().cpu().numpy()
         adv_p95 = np.percentile(adv_np, 95)
         adv_std = adv_np.std()
