@@ -583,14 +583,14 @@ class ImplicitQLearning:
             pass
         elif isinstance(num_seg, str):
             if num_seg == "random":
-                possible_num_segments = torch.arange(1, 11, device=self._device)
+                possible_num_segments = torch.arange(1, 11, device=self.device)
                 segment_lengths = self.traj_length // possible_num_segments
                 segment_lengths_unique = segment_lengths.unique()
                 possible_num_segments_after_unique = self.traj_length // segment_lengths_unique
                 # Random choose the number of segments
                 num_seg = possible_num_segments_after_unique[torch.randint(
                     0, len(possible_num_segments_after_unique), [],
-                    device=self._device)]
+                    device=self.device)]
             else:
                 raise ValueError("Invalid num_seg")
 
