@@ -85,12 +85,8 @@ class TrainConfig:
     name: str = "TIQL_modified_p_ploss_256"  # wandb run name
 
     # New parameters for segment-based critic update
-    use_segment_critic_update: bool = False  # Use segment-based critic update
-    epochs_critic: int = 3  # Number of critic update epochs
-    segment_length: int = 8  # Length of segments for critic update (legacy, not used)
     num_segments: Union[int, str] = 5  # Number of segments (from segments_config) or "random"
-    n_step_return: int = 4  # N-step return for critic update
-    clip_grad_norm: float = 1.0  # Gradient clipping norm
+    clip_grad_norm: float = 0.0  # Gradient clipping norm
     use_mix_precision: bool = False  # Use mixed precision training
     
     # New parameters for segment-based n-step return Q-learning
@@ -516,6 +512,9 @@ class ContinuousCQL:
             cql_clip_diff_min: float = -np.inf,
             cql_clip_diff_max: float = np.inf,
             device: str = "cpu",
+            clip_grad_norm: float = 0.0,
+            num_segments: Union[int, str] = 5,
+            return_type: str = "segment_n_step_return_qf",
     ):
         super().__init__()
 
@@ -543,14 +542,14 @@ class ContinuousCQL:
         # New parameters for segment-based critic update
         self.use_segment_critic_update = False  # Use segment-based critic update
         self.epochs_critic = 3  # Number of critic update epochs
-        self.num_segments = 5  # Number of segments (from segments_config) or "random"
+        self.num_segments = num_segments  # Number of segments (from segments_config) or "random"
         self.n_step_return = 4  # N-step return for critic update
-        self.clip_grad_norm = 1.0  # Gradient clipping norm
+        self.clip_grad_norm = clip_grad_norm  # Gradient clipping norm
         self.use_mix_precision = False  # Use mixed precision training
         
         # New parameters for segment-based n-step return Q-learning
         self.use_segment_n_step_return_qf = True  # Use segment n-step return Q-learning
-        self.return_type = "segment_n_step_return_implicit_vf"  # Type of return computation
+        self.return_type = return_type  # Type of return computation
         # segment_n_step_return_qf
         # segment_n_step_return_implicit_vf
         self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
@@ -2591,8 +2590,8 @@ class ContinuousCQL:
         # self.critic_1_optimizer.step()
         # self.critic_2_optimizer.step()
 
-        if self.total_it % self.target_update_period == 0:
-            self.update_target_network(self.soft_target_update_rate)
+        # if self.total_it % self.target_update_period == 0:
+        #     self.update_target_network(self.soft_target_update_rate)
 
         return log_dict
 
@@ -3068,37 +3067,6 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
 
 
     # CQL policy
-    # policy_kwargs = {
-    #     "mean_net_args": {
-    #         "avg_neuron": 256,
-    #         "num_hidden": 3,
-    #         "shape": 0.0,
-    #     },
-    #     "variance_net_args": {
-    #         "std_only": True,
-    #         "contextual": True,
-    #         "avg_neuron": 256,
-    #         "num_hidden": 3,
-    #         "shape": 0.0,
-    #     },
-    #     "init_method": "orthogonal",
-    #     "out_layer_gain": 0.01,
-    #     "min_std": 1e-5,
-    #     "act_func_hidden": "leaky_relu",
-    #     "act_func_last": None,
-    # }
-    #
-    # actor = pl.TanhGaussianPolicy(
-    #     state_dim,
-    #     action_dim,
-    #     max_action=max_action,
-    #     log_std_multiplier=config.policy_log_std_multiplier,
-    #     orthogonal_init=config.orthogonal_init,
-    #     device=config.device,
-    #     **policy_kwargs,
-    # )
-
-    # IQL policy
     policy_kwargs = {
         "mean_net_args": {
             "avg_neuron": 256,
@@ -3107,27 +3075,58 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         },
         "variance_net_args": {
             "std_only": True,
-            "contextual": False,  # state-independent parameter
-            # "avg_neuron": 256,
-            # "num_hidden": 3,
-            # "shape": 0.0,
+            "contextual": True,
+            "avg_neuron": 256,
+            "num_hidden": 2,
+            "shape": 0.0,
         },
-        "init_method": "orthogonal",  # "orthogonal",
-        "out_layer_gain": 1.0,  # 0.01,
-        # "min_std": 1e-5,
-        "act_func_hidden": "relu",
-        "act_func_last": "tanh",
+        "init_method": "orthogonal",
+        "out_layer_gain": 0.01,
+        "min_std": 1e-5,
+        "act_func_hidden": "leaky_relu",
+        "act_func_last": None,
     }
 
-    actor = pl.GaussianPolicy(
+    actor = pl.TanhGaussianPolicy(
         state_dim,
         action_dim,
         max_action=max_action,
-        # log_std_multiplier=1.0,
-        # orthogonal_init=False,
+        log_std_multiplier=config.policy_log_std_multiplier,
+        orthogonal_init=config.orthogonal_init,
         device=config.device,
         **policy_kwargs,
     )
+
+    # IQL policy
+    # policy_kwargs = {
+    #     "mean_net_args": {
+    #         "avg_neuron": 256,
+    #         "num_hidden": 2,
+    #         "shape": 0.0,
+    #     },
+    #     "variance_net_args": {
+    #         "std_only": True,
+    #         "contextual": False,  # state-independent parameter
+    #         # "avg_neuron": 256,
+    #         # "num_hidden": 3,
+    #         # "shape": 0.0,
+    #     },
+    #     "init_method": "orthogonal",  # "orthogonal",
+    #     "out_layer_gain": 1.0,  # 0.01,
+    #     # "min_std": 1e-5,
+    #     "act_func_hidden": "relu",
+    #     "act_func_last": "tanh",
+    # }
+    #
+    # actor = pl.GaussianPolicy(
+    #     state_dim,
+    #     action_dim,
+    #     max_action=max_action,
+    #     # log_std_multiplier=1.0,
+    #     # orthogonal_init=False,
+    #     device=config.device,
+    #     **policy_kwargs,
+    # )
 
     actor_optimizer = torch.optim.Adam(actor.parameters, config.policy_lr)
 
@@ -3162,6 +3161,8 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         "cql_max_target_backup": config.cql_max_target_backup,
         "cql_clip_diff_min": config.cql_clip_diff_min,
         "cql_clip_diff_max": config.cql_clip_diff_max,
+        "clip_grad_norm": config.clip_grad_norm,
+        "num_segments": config.num_segments,
         # # New parameters for segment-based critic update
         # "use_segment_critic_update": config.use_segment_critic_update,
         # "epochs_critic": config.epochs_critic,
@@ -3172,7 +3173,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         # "use_mix_precision": config.use_mix_precision,
         # # New parameters for segment-based n-step return Q-learning
         # "use_segment_n_step_return_qf": config.use_segment_n_step_return_qf,
-        # "return_type": config.return_type,
+        "return_type": config.return_type,
     }
 
     print("---------------------------------------")

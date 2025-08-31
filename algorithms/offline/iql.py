@@ -97,9 +97,9 @@ class TrainConfig:
 
     clip_grad_norm: float = 0.0
 
-    num_segments: int = 5
+    num_segments: Union[int, str] = "random"
 
-    sequence_length: int = 20
+    sequence_length: int = 40
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -446,7 +446,7 @@ class ImplicitQLearning:
         target_update_period: int = 1,
         random_target: bool = True,
         clip_grad_norm : float = 1.0,
-        num_segments: int = 1,
+        num_segments: Union[int, str] = 1,
     ):
         self.max_action = max_action
         self.actor = actor
@@ -583,7 +583,7 @@ class ImplicitQLearning:
             pass
         elif isinstance(num_seg, str):
             if num_seg == "random":
-                possible_num_segments = torch.arange(1, 26, device=self._device)
+                possible_num_segments = torch.arange(1, 11, device=self._device)
                 segment_lengths = self.traj_length // possible_num_segments
                 segment_lengths_unique = segment_lengths.unique()
                 possible_num_segments_after_unique = self.traj_length // segment_lengths_unique
