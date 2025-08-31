@@ -2,7 +2,7 @@
 # https://arxiv.org/pdf/2110.06169.pdf
 import copy
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-71e5c35b-9eb6-a2a6-9b30-2e108de6212d,GPU-0073f373-55c9-4d6d-7621-ff5615e5f42d"
+os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-71e5c35b-9eb6-a2a6-9b30-2e108de6212d,GPU-0073f373-55c9-4d6d-7621-ff5615e5f42d"
 import random
 import uuid
 from dataclasses import asdict, dataclass
@@ -97,7 +97,9 @@ class TrainConfig:
 
     clip_grad_norm: float = 0.0
 
-    num_segments: int = 1
+    num_segments: int = 5
+
+    sequence_length: int = 20
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -683,6 +685,8 @@ class ImplicitQLearning:
         else:
             future_q = torch.minimum(future_q1, future_q2)
 
+        step_future_q_target = future_q[..., 1]
+
         # Use last q as the target of the V-func
         # [num_traj, num_segments, 1 + num_seg_actions]
         # -> [num_traj, num_segments]
@@ -854,7 +858,7 @@ class ImplicitQLearning:
 
         ####################################################################
 
-        return n_step_returns
+        return n_step_returns, step_future_q_target
 
     # def train(self, batch: TensorBatch) -> Dict[str, float]:
     #     self.total_it += 1
@@ -982,7 +986,7 @@ class ImplicitQLearning:
         seg_actions_idx = util.add_expand_dim(seg_actions_idx, [0],
                                               [num_traj])
 
-        targets = self.segments_n_step_return_implicit_vf(
+        targets, step_q_target = self.segments_n_step_return_implicit_vf(
             observations_seq,
             actions_seq,
             next_observations_seq,
@@ -1010,6 +1014,7 @@ class ImplicitQLearning:
         )
 
         # qf_loss = 0.0
+        current_v = None
 
         for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
             # Use mix precision for faster computation
@@ -1062,6 +1067,11 @@ class ImplicitQLearning:
                     }
                 )
 
+                if not current_v:
+                    current_v = vq_pred[..., 0]
+                else:
+                    current_v = torch.minimum(current_v, vq_pred[..., 0])
+
             # Update critic net parameters
             # util.run_time_test(lock=True, key="update critic net")
             opt.zero_grad(set_to_none=True)
@@ -1096,34 +1106,35 @@ class ImplicitQLearning:
             #                        key="copy critic net"))
 
         # IQL policy update
-        self.critic.eval()  # disable dropout
-        self.critic.requires_grad(False)
-        with torch.no_grad():
-            # online V predictions from both critics (average them to update policy)
-            v1_online = self.critic.critic(self.critic.net1,
-                                           d_state=None, c_state=c_state,
-                                           actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[..., 0]
-            if self.critic.single_q:
-                v_avg = v1_online
-            else:
-                v2_online = self.critic.critic(self.critic.net2,
-                                               d_state=None, c_state=c_state,
-                                               actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[..., 0]
-                # v_avg = 0.5 * (v1_online + v2_online)
-                v_avg = torch.minimum(v1_online, v2_online)
-            q1_target = self.critic.critic(self.critic.target_net1,
-                                           d_state=None, c_state=c_state,
-                                           actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
-                                           idx_a=seg_actions_idx)[..., 1]
-            if self.critic.single_q:
-                q_target_avg = q1_target
-            else:
-                q2_target = self.critic.critic(self.critic.target_net2,
-                                               d_state=None, c_state=c_state,
-                                               actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
-                                               idx_a=seg_actions_idx)[..., 1]
-                # q_target_avg = 0.5 * (q1_target + q2_target)
-                q_target_avg = torch.minimum(q1_target, q2_target)
+        # TODO: if dropout activate, critic should be in eval mode
+        # self.critic.eval()  # disable dropout
+        # self.critic.requires_grad(False)
+        # with torch.no_grad():
+        #     # online V predictions from both critics (average them to update policy)
+        #     v1_online = self.critic.critic(self.critic.net1,
+        #                                    d_state=None, c_state=c_state,
+        #                                    actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[..., 0]
+        #     if self.critic.single_q:
+        #         v_avg = v1_online
+        #     else:
+        #         v2_online = self.critic.critic(self.critic.net2,
+        #                                        d_state=None, c_state=c_state,
+        #                                        actions=seg_actions, idx_d=None, idx_c=seg_start_idx, idx_a=seg_actions_idx)[..., 0]
+        #         # v_avg = 0.5 * (v1_online + v2_online)
+        #         v_avg = torch.minimum(v1_online, v2_online)
+            # q1_target = self.critic.critic(self.critic.target_net1,
+            #                                d_state=None, c_state=c_state,
+            #                                actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+            #                                idx_a=seg_actions_idx)[..., 1]
+            # if self.critic.single_q:
+            #     q_target_avg = q1_target
+            # else:
+            #     q2_target = self.critic.critic(self.critic.target_net2,
+            #                                    d_state=None, c_state=c_state,
+            #                                    actions=seg_actions, idx_d=None, idx_c=seg_start_idx,
+            #                                    idx_a=seg_actions_idx)[..., 1]
+            #     # q_target_avg = 0.5 * (q1_target + q2_target)
+            #     step_q_target = torch.minimum(q1_target, q2_target)
 
         log_dict.update(
             {
@@ -1133,7 +1144,7 @@ class ImplicitQLearning:
 
         # TODO: check the policy update
         # adv = (targets[..., 1] - v_avg).detach()
-        adv = (q_target_avg - v_avg).detach()
+        adv = (step_q_target - v_avg).detach()
         adv_np = adv.detach().cpu().numpy()
         adv_p95 = np.percentile(adv_np, 95)
         adv_std = adv_np.std()
@@ -1264,6 +1275,7 @@ def train(config: TrainConfig):
         config.buffer_size,
         device=config.device,
         env_name = config.env,
+        sequence_length = config.sequence_length,
     )
 
     replay_buffer_modular_seq.load_d4rl_dataset(dataset)
