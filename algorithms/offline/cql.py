@@ -587,116 +587,115 @@ class ContinuousCQL:
         qf1_loss = F.mse_loss(q1_predicted, td_target.detach())
         qf2_loss = F.mse_loss(q2_predicted, td_target.detach())
 
-        # # CQL
-        # batch_size = actions.shape[0]
-        # action_dim = actions.shape[-1]
-        # cql_random_actions = actions.new_empty(
-        #     (batch_size, self.cql_n_actions, action_dim), requires_grad=False
-        # ).uniform_(-1, 1)
-        # cql_current_actions, cql_current_log_pis = self.actor(
-        #     observations, repeat=self.cql_n_actions
-        # )
-        # cql_next_actions, cql_next_log_pis = self.actor(
-        #     next_observations, repeat=self.cql_n_actions
-        # )
-        # cql_current_actions, cql_current_log_pis = (
-        #     cql_current_actions.detach(),
-        #     cql_current_log_pis.detach(),
-        # )
-        # cql_next_actions, cql_next_log_pis = (
-        #     cql_next_actions.detach(),
-        #     cql_next_log_pis.detach(),
-        # )
-        #
-        # cql_q1_rand = self.critic_1(observations, cql_random_actions)
-        # cql_q2_rand = self.critic_2(observations, cql_random_actions)
-        # cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
-        # cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
-        # cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
-        # cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
-        #
-        # cql_cat_q1 = torch.cat(
-        #     [
-        #         cql_q1_rand,
-        #         torch.unsqueeze(q1_predicted, 1),
-        #         cql_q1_next_actions,
-        #         cql_q1_current_actions,
-        #     ],
-        #     dim=1,
-        # )
-        # cql_cat_q2 = torch.cat(
-        #     [
-        #         cql_q2_rand,
-        #         torch.unsqueeze(q2_predicted, 1),
-        #         cql_q2_next_actions,
-        #         cql_q2_current_actions,
-        #     ],
-        #     dim=1,
-        # )
-        # cql_std_q1 = torch.std(cql_cat_q1, dim=1)
-        # cql_std_q2 = torch.std(cql_cat_q2, dim=1)
-        #
-        # if self.cql_importance_sample:
-        #     random_density = np.log(0.5**action_dim)
-        #     cql_cat_q1 = torch.cat(
-        #         [
-        #             cql_q1_rand - random_density,
-        #             cql_q1_next_actions - cql_next_log_pis.detach(),
-        #             cql_q1_current_actions - cql_current_log_pis.detach(),
-        #         ],
-        #         dim=1,
-        #     )
-        #     cql_cat_q2 = torch.cat(
-        #         [
-        #             cql_q2_rand - random_density,
-        #             cql_q2_next_actions - cql_next_log_pis.detach(),
-        #             cql_q2_current_actions - cql_current_log_pis.detach(),
-        #         ],
-        #         dim=1,
-        #     )
-        #
-        # cql_qf1_ood = torch.logsumexp(cql_cat_q1 / self.cql_temp, dim=1) * self.cql_temp
-        # cql_qf2_ood = torch.logsumexp(cql_cat_q2 / self.cql_temp, dim=1) * self.cql_temp
-        #
-        # """Subtract the log likelihood of data"""
-        # cql_qf1_diff = torch.clamp(
-        #     cql_qf1_ood - q1_predicted,
-        #     self.cql_clip_diff_min,
-        #     self.cql_clip_diff_max,
-        # ).mean()
-        # cql_qf2_diff = torch.clamp(
-        #     cql_qf2_ood - q2_predicted,
-        #     self.cql_clip_diff_min,
-        #     self.cql_clip_diff_max,
-        # ).mean()
-        #
-        # if self.cql_lagrange:
-        #     alpha_prime = torch.clamp(
-        #         torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0
-        #     )
-        #     cql_min_qf1_loss = (
-        #         alpha_prime
-        #         * self.cql_alpha
-        #         * (cql_qf1_diff - self.cql_target_action_gap)
-        #     )
-        #     cql_min_qf2_loss = (
-        #         alpha_prime
-        #         * self.cql_alpha
-        #         * (cql_qf2_diff - self.cql_target_action_gap)
-        #     )
-        #
-        #     self.alpha_prime_optimizer.zero_grad()
-        #     alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss) * 0.5
-        #     alpha_prime_loss.backward(retain_graph=True)
-        #     self.alpha_prime_optimizer.step()
-        # else:
-        #     cql_min_qf1_loss = cql_qf1_diff * self.cql_alpha
-        #     cql_min_qf2_loss = cql_qf2_diff * self.cql_alpha
-        #     alpha_prime_loss = observations.new_tensor(0.0)
-        #     alpha_prime = observations.new_tensor(0.0)
+        # CQL
+        batch_size = actions.shape[0]
+        action_dim = actions.shape[-1]
+        cql_random_actions = actions.new_empty(
+            (batch_size, self.cql_n_actions, action_dim), requires_grad=False
+        ).uniform_(-1, 1)
+        cql_current_actions, cql_current_log_pis = self.actor(
+            observations, repeat=self.cql_n_actions
+        )
+        cql_next_actions, cql_next_log_pis = self.actor(
+            next_observations, repeat=self.cql_n_actions
+        )
+        cql_current_actions, cql_current_log_pis = (
+            cql_current_actions.detach(),
+            cql_current_log_pis.detach(),
+        )
+        cql_next_actions, cql_next_log_pis = (
+            cql_next_actions.detach(),
+            cql_next_log_pis.detach(),
+        )
 
-        qf_loss = qf1_loss + qf2_loss
-        # + cql_min_qf1_loss + cql_min_qf2_loss)
+        cql_q1_rand = self.critic_1(observations, cql_random_actions)
+        cql_q2_rand = self.critic_2(observations, cql_random_actions)
+        cql_q1_current_actions = self.critic_1(observations, cql_current_actions)
+        cql_q2_current_actions = self.critic_2(observations, cql_current_actions)
+        cql_q1_next_actions = self.critic_1(observations, cql_next_actions)
+        cql_q2_next_actions = self.critic_2(observations, cql_next_actions)
+
+        cql_cat_q1 = torch.cat(
+            [
+                cql_q1_rand,
+                torch.unsqueeze(q1_predicted, 1),
+                cql_q1_next_actions,
+                cql_q1_current_actions,
+            ],
+            dim=1,
+        )
+        cql_cat_q2 = torch.cat(
+            [
+                cql_q2_rand,
+                torch.unsqueeze(q2_predicted, 1),
+                cql_q2_next_actions,
+                cql_q2_current_actions,
+            ],
+            dim=1,
+        )
+        cql_std_q1 = torch.std(cql_cat_q1, dim=1)
+        cql_std_q2 = torch.std(cql_cat_q2, dim=1)
+
+        if self.cql_importance_sample:
+            random_density = np.log(0.5**action_dim)
+            cql_cat_q1 = torch.cat(
+                [
+                    cql_q1_rand - random_density,
+                    cql_q1_next_actions - cql_next_log_pis.detach(),
+                    cql_q1_current_actions - cql_current_log_pis.detach(),
+                ],
+                dim=1,
+            )
+            cql_cat_q2 = torch.cat(
+                [
+                    cql_q2_rand - random_density,
+                    cql_q2_next_actions - cql_next_log_pis.detach(),
+                    cql_q2_current_actions - cql_current_log_pis.detach(),
+                ],
+                dim=1,
+            )
+
+        cql_qf1_ood = torch.logsumexp(cql_cat_q1 / self.cql_temp, dim=1) * self.cql_temp
+        cql_qf2_ood = torch.logsumexp(cql_cat_q2 / self.cql_temp, dim=1) * self.cql_temp
+
+        """Subtract the log likelihood of data"""
+        cql_qf1_diff = torch.clamp(
+            cql_qf1_ood - q1_predicted,
+            self.cql_clip_diff_min,
+            self.cql_clip_diff_max,
+        ).mean()
+        cql_qf2_diff = torch.clamp(
+            cql_qf2_ood - q2_predicted,
+            self.cql_clip_diff_min,
+            self.cql_clip_diff_max,
+        ).mean()
+
+        if self.cql_lagrange:
+            alpha_prime = torch.clamp(
+                torch.exp(self.log_alpha_prime()), min=0.0, max=1000000.0
+            )
+            cql_min_qf1_loss = (
+                alpha_prime
+                * self.cql_alpha
+                * (cql_qf1_diff - self.cql_target_action_gap)
+            )
+            cql_min_qf2_loss = (
+                alpha_prime
+                * self.cql_alpha
+                * (cql_qf2_diff - self.cql_target_action_gap)
+            )
+
+            self.alpha_prime_optimizer.zero_grad()
+            alpha_prime_loss = (-cql_min_qf1_loss - cql_min_qf2_loss) * 0.5
+            alpha_prime_loss.backward(retain_graph=True)
+            self.alpha_prime_optimizer.step()
+        else:
+            cql_min_qf1_loss = cql_qf1_diff * self.cql_alpha
+            cql_min_qf2_loss = cql_qf2_diff * self.cql_alpha
+            alpha_prime_loss = observations.new_tensor(0.0)
+            alpha_prime = observations.new_tensor(0.0)
+
+        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
         # print("QF Loss:", qf1_loss.item(), qf2_loss.item(), cql_min_qf1_loss.item(),
         #       cql_min_qf2_loss.item())
 
