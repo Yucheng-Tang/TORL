@@ -85,9 +85,10 @@ class TrainConfig:
     name: str = "TIQL_modified_p_ploss_256"  # wandb run name
 
     # New parameters for segment-based critic update
-    num_segments: Union[int, str] = 5  # Number of segments (from segments_config) or "random"
+    num_segments: Union[int, str] = 1  # Number of segments (from segments_config) or "random"
     clip_grad_norm: float = 0.0  # Gradient clipping norm
     use_mix_precision: bool = False  # Use mixed precision training
+    sequence_length: int = 1
     
     # New parameters for segment-based n-step return Q-learning
     use_segment_n_step_return_qf: bool = False  # Use segment n-step return Q-learning
@@ -2904,6 +2905,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         replay_buffer_norm_info,
         config.buffer_size,
         device=config.device,
+        sequence_length=config.sequence_length,
     )
 
     replay_buffer_modular_seq.load_d4rl_dataset(dataset_2)

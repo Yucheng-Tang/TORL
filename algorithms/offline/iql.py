@@ -42,7 +42,7 @@ class TrainConfig:
     # wandb group name
     group: str = "IQL-D4RL"
     # wandb run name
-    name: str = "IQL_rp_a"
+    name: str = "IQL_tau0.9"
     # training dataset and evaluation environment
     env: str = "halfcheetah-medium-expert-v2"
     # discount factor
@@ -55,7 +55,7 @@ class TrainConfig:
     # coefficient for asymmetric critic loss
     # small tau -> optimistic, big beta -> conservative
     # (tau-1)
-    iql_tau: float = 0.7 # 0.7
+    iql_tau: float = 0.9 # 0.7
     # whether to use deterministic actor
     iql_deterministic: bool = False
     # total gradient updates during training
@@ -87,7 +87,7 @@ class TrainConfig:
     # training random seed
     seed: int = 0
     # training device
-    device: str = "cuda"
+    device: str = "cuda:1"
 
     lr_critic: float = 3e-4
 
@@ -97,9 +97,9 @@ class TrainConfig:
 
     clip_grad_norm: float = 0.0
 
-    num_segments: Union[int, str] = "random"
+    num_segments: Union[int, str] = 5
 
-    sequence_length: int = 40
+    sequence_length: int = 20
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
