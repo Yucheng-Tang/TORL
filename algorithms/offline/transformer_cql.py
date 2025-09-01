@@ -81,8 +81,8 @@ class TrainConfig:
     reward_bias: float = -1.0  # Reward bias for normalization
     policy_log_std_multiplier: float = 1.0  # Stochastic policy std multiplier
     project: str = "TORL"  # wandb project name
-    group: str = "TIQL-D4RL"  # wandb group name
-    name: str = "TIQL_modified_p_ploss_256"  # wandb run name
+    group: str = "TCQL-D4RL"  # wandb group name
+    name: str = "TCQL_origin_p"  # wandb run name
 
     # New parameters for segment-based critic update
     num_segments: Union[int, str] = 1  # Number of segments (from segments_config) or "random"
@@ -93,6 +93,9 @@ class TrainConfig:
     # New parameters for segment-based n-step return Q-learning
     use_segment_n_step_return_qf: bool = False  # Use segment n-step return Q-learning
     return_type: str = "segment_n_step_return_qf"  # Type of return computation
+
+    lr_critic: float = 3e-4
+    random_target: bool = False
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -219,7 +222,7 @@ def wandb_init(config: dict) -> None:
         project=config["project"],
         group=config["group"],
         name=config["name"],
-        entity="tyc1333",
+        # entity="tyc1333",
         id=str(uuid.uuid4()),
     )
     wandb.run.save()
@@ -415,7 +418,7 @@ class TanhGaussianPolicy(nn.Module):
             repeat: bool = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if repeat is not None:
-            observations = extend_and_repeat(observations, 1, repeat)
+            observations = extend_and_repeat(observations, 2, repeat)
         base_network_output = self.base_network(observations)
         mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
         log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
@@ -516,6 +519,9 @@ class ContinuousCQL:
             clip_grad_norm: float = 0.0,
             num_segments: Union[int, str] = 5,
             return_type: str = "segment_n_step_return_qf",
+            wd_critic: int = 1e-5,
+            lr_critic: int = 5e-5,
+            random_target: bool = True,
     ):
         super().__init__()
 
@@ -558,8 +564,8 @@ class ContinuousCQL:
         self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
         self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda")
 
-        self.random_target = True  # Use random target for segment n-step return
-        self.discount_factor = torch.tensor(float(1),
+        self.random_target = random_target  # Use random target for segment n-step return
+        self.discount_factor = torch.tensor(self.discount,
                                             dtype=self.dtype,
                                             device=self.device)  # Discount factor for segment n-step return
         self.targets_overestimate = False
@@ -593,8 +599,8 @@ class ContinuousCQL:
         #     betas=(0.9, 0.999),
         # )
 
-        self.wd_critic = 1e-5
-        self.lr_critic = 5e-5
+        self.wd_critic = wd_critic
+        self.lr_critic = lr_critic
         self.betas = (0.9, 0.999)
         self.critic_1_optimizer, self.critic_2_optimizer = self.critic.configure_optimizer(
             weight_decay=self.wd_critic, learning_rate=self.lr_critic,
@@ -633,9 +639,7 @@ class ContinuousCQL:
 
         self.progress_bar = tqdm(total=1e6)
 
-        self.iql_tau = 0.7
-
-        self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, 1000000)
+        self.log_now = False
 
 
     def get_segments(self, pad_additional=False):
@@ -1354,7 +1358,7 @@ class ContinuousCQL:
         # For step-based actor, only sample action based on the initial state
         with torch.no_grad():
             # n_actions, n_action_log_pi = self.actor.sample(n_states_seq, num_samples=self.num_samples_in_targets)
-            n_actions, n_action_log_pi = self.actor(n_states_seq, self.num_samples_in_targets)
+            n_actions, n_action_log_pi = self.actor(n_states_seq, repeat=self.num_samples_in_targets)
 
         # Normalize actions
         if self.norm_data:
@@ -1456,7 +1460,7 @@ class ContinuousCQL:
 
         future_q_sampled = torch.zeros([num_traj, traj_length],
                                device=self.device)
-        future_q_sampled = min_q1_q2[..., 1].squeeze()
+        future_q_sampled = min_q1_q2[..., 1]
 
         # Pad zeros to the states which go beyond the traj length
         future_q_pad_zero_end \
@@ -1883,6 +1887,11 @@ class ContinuousCQL:
                                                                                        vq_predict=vq_pred,
                                                                                        )
 
+                        # # SAC test
+                        cql_loss = cql_loss.new_zeros(cql_loss.shape)
+                        # alpha_prime
+                        # alpha_prime_loss
+
                         qf1_value = vq_pred[..., 1] - targets[..., 1] # log Q(s, a)
 
                         log_dict.update(
@@ -1983,24 +1992,24 @@ class ContinuousCQL:
         # self._update_policy(adv, observations_step, actions_step, log_dict)
 
         # CQL
-        # policy_loss = self._policy_loss(
-        #     observations_step, actions_step, new_actions, alpha, log_pi
-        # )
-        #
-        # log_dict.update(
-        #     dict(
-        #     policy_loss=policy_loss.item(),
-        #     )
-        # )
-        #
-        # if self.use_automatic_entropy_tuning:
-        #     self.alpha_optimizer.zero_grad()
-        #     alpha_loss.backward()
-        #     self.alpha_optimizer.step()
-        #
-        # self.actor_optimizer.zero_grad()
-        # policy_loss.backward()
-        # self.actor_optimizer.step()
+        policy_loss = self._policy_loss(
+            observations_step, actions_step, new_actions, alpha, log_pi
+        )
+
+        log_dict.update(
+            dict(
+            policy_loss=policy_loss.item(),
+            )
+        )
+
+        if self.use_automatic_entropy_tuning:
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+
+        self.actor_optimizer.zero_grad()
+        policy_loss.backward()
+        self.actor_optimizer.step()
 
         # # unfreeze critic params afterwards
         # for p in self.critic.parameters:
@@ -2131,8 +2140,8 @@ class ContinuousCQL:
         # a_step_c, log_pi_c = self.actor.sample(c_state_seq, self.num_samples_in_cql_loss)
         # a_step_n, log_pi_n = self.actor.sample(n_state_seq, self.num_samples_in_cql_loss)
 
-        a_step_c, log_pi_c = self.actor(c_state_seq, self.num_samples_in_cql_loss)
-        a_step_n, log_pi_n = self.actor(n_state_seq, self.num_samples_in_cql_loss)
+        a_step_c, log_pi_c = self.actor(c_state_seq, repeat=self.num_samples_in_cql_loss)
+        a_step_n, log_pi_n = self.actor(n_state_seq, repeat=self.num_samples_in_cql_loss)
 
         # a_step_c, log_pi_c = self.actor(c_state_seq)
         # a_step_n, log_pi_n = self.actor(n_state_seq)
@@ -2482,6 +2491,8 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         # # New parameters for segment-based n-step return Q-learning
         # "use_segment_n_step_return_qf": config.use_segment_n_step_return_qf,
         "return_type": config.return_type,
+        "lr_critic": config.lr_critic,
+        "random_target": config.random_target,
     }
 
     print("---------------------------------------")
