@@ -1353,8 +1353,8 @@ class ContinuousCQL:
         # [num_traj, num_segments, num_smps, 1, dim_action]
         # For step-based actor, only sample action based on the initial state
         with torch.no_grad():
-            n_actions, n_action_log_pi = self.actor.sample(n_states_seq, num_samples=self.num_samples_in_targets)
-            # n_actions, n_action_log_pi = self.actor(n_states_seq)
+            # n_actions, n_action_log_pi = self.actor.sample(n_states_seq, num_samples=self.num_samples_in_targets)
+            n_actions, n_action_log_pi = self.actor(n_states_seq, self.num_samples_in_targets)
 
         # Normalize actions
         if self.norm_data:
@@ -1591,8 +1591,8 @@ class ContinuousCQL:
         ) = step_batch
         self.total_it += 1
 
-        # new_actions, log_pi = self.actor(observations_step)
-        new_actions, log_pi = self.actor.sample(observations_step, self.num_samples_in_policy)
+        new_actions, log_pi = self.actor(observations_step)
+        # new_actions, log_pi = self.actor.sample(observations_step, self.num_samples_in_policy)
         # new_actions_seq = torch.cat([new_actions, actions_seq[..., 1:]], dim=-1,)
         # TODO: use actions_seq to feed transformer to get Q(s, a)
         if self.num_samples_in_policy == 1:
@@ -2128,8 +2128,11 @@ class ContinuousCQL:
 
         # # generate t and t+1 step-based actions using current states and next states
         # # [num_batch, num_segments, num_smps, num_seg_actions, dim_action]
-        a_step_c, log_pi_c = self.actor.sample(c_state_seq, self.num_samples_in_cql_loss)
-        a_step_n, log_pi_n = self.actor.sample(n_state_seq, self.num_samples_in_cql_loss)
+        # a_step_c, log_pi_c = self.actor.sample(c_state_seq, self.num_samples_in_cql_loss)
+        # a_step_n, log_pi_n = self.actor.sample(n_state_seq, self.num_samples_in_cql_loss)
+
+        a_step_c, log_pi_c = self.actor(c_state_seq, self.num_samples_in_cql_loss)
+        a_step_n, log_pi_n = self.actor(n_state_seq, self.num_samples_in_cql_loss)
 
         # a_step_c, log_pi_c = self.actor(c_state_seq)
         # a_step_n, log_pi_n = self.actor(n_state_seq)
@@ -2298,7 +2301,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         sequence_length=config.sequence_length,
     )
 
-    replay_buffer_modular_seq.load_d4rl_dataset(dataset_2)
+    replay_buffer_modular_seq.load_d4rl_dataset(dataset)
     replay_buffer_modular_seq.update_buffer_normalizer()
 
     max_action = float(env.action_space.high[0])
