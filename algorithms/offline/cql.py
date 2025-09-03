@@ -23,7 +23,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda"
+    device: str = "cuda:1"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -695,40 +695,41 @@ class ContinuousCQL:
             alpha_prime_loss = observations.new_tensor(0.0)
             alpha_prime = observations.new_tensor(0.0)
 
-        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+        qf_loss = qf1_loss + qf2_loss
+                   # + cql_min_qf1_loss + cql_min_qf2_loss
         # print("QF Loss:", qf1_loss.item(), qf2_loss.item(), cql_min_qf1_loss.item(),
         #       cql_min_qf2_loss.item())
 
         log_dict.update(
             dict(
-                qf1_loss=qf1_loss.item(),
-                qf2_loss=qf2_loss.item(),
-                alpha=alpha.item(),
-                average_qf1=q1_predicted.mean().item(),
-                average_qf2=q2_predicted.mean().item(),
-                average_target_q=target_q_values.mean().item(),
-                average_reward=rewards.mean().item(),
+                net1_q_loss_original=qf1_loss.item(),
+                net2_q_loss_original=qf2_loss.item(),
+                alpha_original=alpha.item(),
+                net1_q_mean_original=q1_predicted.mean().item(),
+                net2_q_mean_original=q2_predicted.mean().item(),
+                average_target_q_original=target_q_values.mean().item(),
+                average_reward_original=rewards.mean().item(),
             )
         )
 
-        log_dict.update(
-            dict(
-                cql_std_q1=cql_std_q1.mean().item(),
-                cql_std_q2=cql_std_q2.mean().item(),
-                cql_q1_rand=cql_q1_rand.mean().item(),
-                cql_q2_rand=cql_q2_rand.mean().item(),
-                cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
-                cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
-                cql_qf1_diff=cql_qf1_diff.mean().item(),
-                cql_qf2_diff=cql_qf2_diff.mean().item(),
-                cql_q1_current_actions=cql_q1_current_actions.mean().item(),
-                cql_q2_current_actions=cql_q2_current_actions.mean().item(),
-                cql_q1_next_actions=cql_q1_next_actions.mean().item(),
-                cql_q2_next_actions=cql_q2_next_actions.mean().item(),
-                alpha_prime_loss=alpha_prime_loss.item(),
-                alpha_prime=alpha_prime.item(),
-            )
-        )
+        # log_dict.update(
+        #     dict(
+        #         cql_std_q1=cql_std_q1.mean().item(),
+        #         cql_std_q2=cql_std_q2.mean().item(),
+        #         cql_q1_rand=cql_q1_rand.mean().item(),
+        #         cql_q2_rand=cql_q2_rand.mean().item(),
+        #         cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
+        #         cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+        #         cql_qf1_diff=cql_qf1_diff.mean().item(),
+        #         cql_qf2_diff=cql_qf2_diff.mean().item(),
+        #         cql_q1_current_actions=cql_q1_current_actions.mean().item(),
+        #         cql_q2_current_actions=cql_q2_current_actions.mean().item(),
+        #         cql_q1_next_actions=cql_q1_next_actions.mean().item(),
+        #         cql_q2_next_actions=cql_q2_next_actions.mean().item(),
+        #         alpha_prime_loss=alpha_prime_loss.item(),
+        #         alpha_prime=alpha_prime.item(),
+        #     )
+        # )
 
         return qf_loss, alpha_prime, alpha_prime_loss
 

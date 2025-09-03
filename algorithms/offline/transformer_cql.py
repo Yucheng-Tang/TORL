@@ -416,10 +416,12 @@ class TanhGaussianPolicy(nn.Module):
             observations: torch.Tensor,
             deterministic: bool = False,
             repeat: bool = None,
+            num_samples: int = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if repeat is not None:
             observations = extend_and_repeat(observations, 1, repeat)
-            # observations = extend_and_repeat(observations, 2, repeat)
+        if num_samples is not None:
+            observations = extend_and_repeat(observations, 2, num_samples)
         base_network_output = self.base_network(observations)
         mean, log_std = torch.split(base_network_output, self.action_dim, dim=-1)
         log_std = self.log_std_multiplier() * log_std + self.log_std_offset()
@@ -497,6 +499,9 @@ class ContinuousCQL:
             # critic, # modified for cql test
             actor,
             actor_optimizer,
+            # for test
+            actor_original,
+            actor_optimizer_original,
             target_entropy: float,
             discount: float = 0.99,
             alpha_multiplier: float = 1.0,
@@ -523,6 +528,7 @@ class ContinuousCQL:
             wd_critic: int = 1e-5,
             lr_critic: int = 5e-5,
             random_target: bool = True,
+            dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
 
@@ -563,7 +569,10 @@ class ContinuousCQL:
         self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
         self.num_samples_in_policy = 1
         self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
-        self.dtype, self.device = util.parse_dtype_device("torch.float32", "cuda")
+
+        self.total_it = 0
+        self.device = device
+        self.dtype = dtype
 
         self.random_target = random_target  # Use random target for segment n-step return
         self.discount_factor = torch.tensor(self.discount,
@@ -573,8 +582,6 @@ class ContinuousCQL:
         
         # Initialize traj_length (will be set during training)
         self.traj_length = None
-
-        self.total_it = 0
 
         self.norm_data = False  # Normalize states
 
@@ -589,6 +596,12 @@ class ContinuousCQL:
         self.actor = actor
 
         self.actor_optimizer = actor_optimizer
+        
+        # for test
+        self.actor_original = actor_original
+
+        self.actor_optimizer_original= actor_optimizer_original
+        
         # self.critic_1_optimizer = critic_1_optimizer
         # self.critic_2_optimizer = critic_2_optimizer
         # self.critic = None
@@ -598,8 +611,8 @@ class ContinuousCQL:
 
         self.target_critic_1 = deepcopy(self.critic_1).to(device)
         self.target_critic_2 = deepcopy(self.critic_2).to(device)
-        self.critic_1_optimizer = critic_1_optimizer
-        self.critic_2_optimizer = critic_2_optimizer
+        self.critic_1_optimizer_original = critic_1_optimizer
+        self.critic_2_optimizer_original = critic_2_optimizer
         self.critic = None
 
         # self.critic = critic
@@ -611,11 +624,20 @@ class ContinuousCQL:
         #     weight_decay=self.wd_critic, learning_rate=self.lr_critic,
         #     betas=self.betas)
         # self.critic_optimizer = (self.critic_1_optimizer, self.critic_2_optimizer)
-
+        #
         # if not self.critic.single_q:
         #     self.critic_grad_scaler = [GradScaler(), GradScaler()]
         # else:
         #     self.critic_grad_scaler = [GradScaler()] * 2
+
+        if self.use_automatic_entropy_tuning:
+            self.log_alpha_original = Scalar(0.0)
+            self.alpha_optimizer_original = torch.optim.Adam(
+                self.log_alpha_original.parameters(),
+                lr=self.policy_lr,
+            )
+        else:
+            self.log_alpha_original = None
 
         if self.use_automatic_entropy_tuning:
             self.log_alpha = Scalar(0.0)
@@ -689,11 +711,11 @@ class ContinuousCQL:
         else:
             return idx_in_segments
 
-    # def update_target_network(self, soft_target_update_rate: float):
-    #     soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
-    #     soft_update(self.critic.target_net2, self.critic.net2, soft_target_update_rate)
-
     def update_target_network(self, soft_target_update_rate: float):
+        soft_update(self.critic.target_net1, self.critic.net1, soft_target_update_rate)
+        soft_update(self.critic.target_net2, self.critic.net2, soft_target_update_rate)
+
+    def update_target_network_original(self, soft_target_update_rate: float):
         soft_update(self.target_critic_1, self.critic_1, soft_target_update_rate)
         soft_update(self.target_critic_2, self.critic_2, soft_target_update_rate)
 
@@ -757,7 +779,7 @@ class ContinuousCQL:
     #         # TODO: add entropy loss and trust region loss to policy loss
     #     return policy_loss
 
-    def _policy_loss(
+    def _policy_loss_original(
         self,
         observations: torch.Tensor,
         actions: torch.Tensor,
@@ -796,6 +818,50 @@ class ContinuousCQL:
             #         actions=new_actions, idx_d=None, idx_c=idx_c,
             #         idx_a=idx_a)[..., 1:]
             # )
+
+
+            policy_loss = (alpha * log_pi - q_new_actions).mean()
+        return policy_loss
+
+    def _policy_loss(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        new_actions: torch.Tensor,
+        alpha: torch.Tensor,
+        log_pi: torch.Tensor,
+    ) -> torch.Tensor:
+        observations = observations.unsqueeze(1)
+        idx_c = torch.ones((observations.shape[0], observations.shape[1],), dtype=torch.int64, device=self._device)
+        if new_actions.ndim == 2:
+            new_actions = new_actions.unsqueeze(1).unsqueeze(1)
+            log_pi = log_pi.unsqueeze(1).unsqueeze(1)
+            idx_a = torch.ones((observations.shape[0], observations.shape[1], new_actions.shape[1]), dtype=torch.int64,
+                               device=self._device)
+        else:
+            # for action_sequence, not checked yet
+            idx_in_segments = self.get_segments()
+            num_segments = idx_in_segments.shape[0]
+            idx_a = idx_in_segments[..., :-1]
+
+        if self.total_it <= self.bc_steps:
+            log_probs = self.actor.log_prob(observations, actions)
+            policy_loss = (alpha * log_pi - log_probs).mean()
+        else:
+            # q_new_actions = torch.min(
+            #     self.critic_1(observations, new_actions),
+            #     self.critic_2(observations, new_actions),
+            # )
+            q_new_actions = torch.min(
+                self.critic.critic(
+                net=self.critic.net1, d_state=None, c_state=observations,
+                actions=new_actions, idx_d=None, idx_c=idx_c,
+                idx_a=idx_a)[..., 1:],
+                self.critic.critic(
+                    net=self.critic.net2, d_state=None, c_state=observations,
+                    actions=new_actions, idx_d=None, idx_c=idx_c,
+                    idx_a=idx_a)[..., 1:]
+            )
 
 
             policy_loss = (alpha * log_pi - q_new_actions).mean()
@@ -940,6 +1006,7 @@ class ContinuousCQL:
 
         target_q_values = target_q_values.unsqueeze(-1)
         td_target = rewards + (1.0 - dones) * self.discount * target_q_values.detach()
+        # print("original td_target: ", td_target[0], "Q: ", target_q_values[0], "R: ", rewards[0])
         td_target = td_target.squeeze(-1)
         qf1_loss = F.mse_loss(q1_predicted, td_target.detach())
         qf2_loss = F.mse_loss(q2_predicted, td_target.detach())
@@ -1059,13 +1126,13 @@ class ContinuousCQL:
 
         log_dict.update(
             dict(
-                qf1_loss=qf1_loss.item(),
-                qf2_loss=qf2_loss.item(),
-                alpha=alpha.item(),
-                average_qf1=q1_predicted.mean().item(),
-                average_qf2=q2_predicted.mean().item(),
-                average_target_q=target_q_values.mean().item(),
-                average_reward=rewards.mean().item(),
+                net1_q_loss_original=qf1_loss.item(),
+                net2_q_loss_original=qf2_loss.item(),
+                alpha_original=alpha.item(),
+                net1_q_mean_original=q1_predicted.mean().item(),
+                net2_q_mean_original=q2_predicted.mean().item(),
+                average_target_q_original=target_q_values.mean().item(),
+                average_reward_original=rewards.mean().item(),
             )
         )
 
@@ -1381,7 +1448,7 @@ class ContinuousCQL:
         # For step-based actor, only sample action based on the initial state
         with torch.no_grad():
             # n_actions, n_action_log_pi = self.actor.sample(n_states_seq, num_samples=self.num_samples_in_targets)
-            n_actions, n_action_log_pi = self.actor(n_states_seq, repeat=self.num_samples_in_targets)
+            n_actions, n_action_log_pi = self.actor(n_states_seq, num_samples=self.num_samples_in_targets)
 
         # Normalize actions
         if self.norm_data:
@@ -1572,6 +1639,7 @@ class ContinuousCQL:
             dim=-1) + seg_discount_q) / discount_start
 
         ####################################################################
+        # print("n_step_returns", n_step_returns[0, 0, 1], "Q:", min_q1_q2[0, 0, 1], "R:", rewards[0])
 
         return n_step_returns
 
@@ -1621,27 +1689,42 @@ class ContinuousCQL:
         ) = step_batch
         self.total_it += 1
 
+        new_actions_original, log_pi_original = self.actor_original(observations_step)
         new_actions, log_pi = self.actor(observations_step)
+
         # new_actions, log_pi = self.actor.sample(observations_step, self.num_samples_in_policy)
         # new_actions_seq = torch.cat([new_actions, actions_seq[..., 1:]], dim=-1,)
         # TODO: use actions_seq to feed transformer to get Q(s, a)
         if self.num_samples_in_policy == 1:
             new_actions = new_actions.squeeze()
 
+        alpha_original, alpha_loss_original = self._alpha_and_alpha_loss(observations_step, log_pi_original)
         alpha, alpha_loss = self._alpha_and_alpha_loss(observations_step, log_pi)
 
         # TODO: put back after segment critic update is implemented
         """ Policy loss """
-        policy_loss = self._policy_loss(
-            observations_step, actions_step, new_actions, alpha, log_pi
+
+        policy_loss_original = self._policy_loss_original(
+            observations_step, actions_step, new_actions_original, alpha_original, log_pi_original
         )
 
+        # policy_loss = self._policy_loss(
+        #     observations_step, actions_step, new_actions, alpha, log_pi
+        # )
+
         log_dict = dict(
-            log_pi=log_pi.mean().item(),
+            log_pi_original=log_pi_original.mean().item(),
             # policy_loss=policy_loss.item(),
-            alpha_loss=alpha_loss.item(),
-            alpha=alpha.item(),
+            alpha_loss_original=alpha_loss_original.item(),
+            alpha_original=alpha_original.item(),
         )
+
+        # log_dict = dict(
+        #     log_pi=log_pi.mean().item(),
+        #     # policy_loss=policy_loss.item(),
+        #     alpha_loss=alpha_loss.item(),
+        #     alpha=alpha.item(),
+        # )
 
         """ Q function loss """
         ########################################################################
@@ -1899,6 +1982,8 @@ class ContinuousCQL:
                         vq_sum = torch.sum(vq_diff ** 2)
                         critic_loss = mse(vq_pred[..., 1:] , targets[..., 1:])  # Both V and Q
 
+                        critic_loss_list.append(critic_loss)
+
                         # print("critic_loss", critic_loss.item())
 
                         # cql_loss, alpha_prime, alpha_prime_loss = self.cql_critic_loss(net=net,
@@ -1989,17 +2074,17 @@ class ContinuousCQL:
 
             update_critic_time = util.run_time_test(lock=False, key="update critic")
             self.targets_overestimate = np.mean(targets_bias_list) > 1
-        else:
+        # else:
             # Use original critic update
-            qf_loss, alpha_prime, alpha_prime_loss = self._q_loss(
-                observations_step,
-                actions_step,
-                next_observations_step,
-                rewards_step,
-                dones_step,
-                alpha,
-                log_dict
-            )
+        qf_loss_original, alpha_prime_original, alpha_prime_loss_original = self._q_loss(
+            observations_step,
+            actions_step,
+            next_observations_step,
+            rewards_step,
+            dones_step,
+            alpha_original,
+            log_dict
+        )
         # ########################################################################
         # #                             Update policy
         # ########################################################################
@@ -2023,20 +2108,35 @@ class ContinuousCQL:
         #     observations_step, actions_step, new_actions, alpha, log_pi
         # )
 
+        # log_dict.update(
+        #     dict(
+        #     policy_loss=policy_loss.item(),
+        #     )
+        # )
+        #
+        # if self.use_automatic_entropy_tuning:
+        #     self.alpha_optimizer.zero_grad()
+        #     alpha_loss.backward()
+        #     self.alpha_optimizer.step()
+        #
+        # self.actor_optimizer.zero_grad()
+        # policy_loss.backward()
+        # self.actor_optimizer.step()
+
         log_dict.update(
             dict(
-            policy_loss=policy_loss.item(),
+                policy_loss_original=policy_loss_original.item(),
             )
         )
 
         if self.use_automatic_entropy_tuning:
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+            self.alpha_optimizer_original.zero_grad()
+            alpha_loss_original.backward()
+            self.alpha_optimizer_original.step()
 
-        self.actor_optimizer.zero_grad()
-        policy_loss.backward()
-        self.actor_optimizer.step()
+        self.actor_optimizer_original.zero_grad()
+        policy_loss_original.backward()
+        self.actor_optimizer_original.step()
 
         # # unfreeze critic params afterwards
         # for p in self.critic.parameters:
@@ -2055,14 +2155,32 @@ class ContinuousCQL:
         # self.critic_2_optimizer.step()
 
         # for cql_test
-        self.critic_1_optimizer.zero_grad()
-        self.critic_2_optimizer.zero_grad()
-        qf_loss.backward(retain_graph=True)
-        self.critic_1_optimizer.step()
-        self.critic_2_optimizer.step()
+        self.critic_1_optimizer_original.zero_grad()
+        self.critic_2_optimizer_original.zero_grad()
+        qf_loss_original.backward(retain_graph=True)
+        self.critic_1_optimizer_original.step()
+        self.critic_2_optimizer_original.step()
 
         if self.total_it % self.target_update_period == 0:
-            self.update_target_network(self.soft_target_update_rate)
+            self.update_target_network_original(self.soft_target_update_rate)
+
+
+        # # util.run_time_test(lock=True, key="update critic net")
+        # self.critic_optimizer[0].zero_grad(set_to_none=True)
+        # self.critic_optimizer[1].zero_grad(set_to_none=True)
+        #
+        # # critic_loss.backward()
+        # self.critic_grad_scaler[0].scale(critic_loss_list[0]).backward()
+        # self.critic_grad_scaler[1].scale(critic_loss_list[1]).backward()
+        #
+        # # opt.step()
+        # self.critic_grad_scaler[0].step(self.critic_optimizer[0])
+        # self.critic_grad_scaler[0].update()
+        # self.critic_grad_scaler[1].step(self.critic_optimizer[1])
+        # self.critic_grad_scaler[1].update()
+        #
+        # self.critic.update_target_net(self.critic.net1, self.critic.target_net1)
+        # self.critic.update_target_net(self.critic.net2, self.critic.target_net2)
 
         return log_dict
 
@@ -2387,7 +2505,7 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         "relative_pos": False
     }
 
-    # critic = seq_critic.SeqCritic(**critic_config)
+    critic = seq_critic.SeqCritic(**critic_config)
 
     critic_1 = FullyConnectedQFunction(
         state_dim,
@@ -2409,6 +2527,15 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         orthogonal_init=config.orthogonal_init,
     ).to(config.device)
     actor_optimizer = torch.optim.Adam(actor.parameters(), config.policy_lr)
+
+    actor_original = TanhGaussianPolicy(
+        state_dim,
+        action_dim,
+        max_action,
+        log_std_multiplier=config.policy_log_std_multiplier,
+        orthogonal_init=config.orthogonal_init,
+    ).to(config.device)
+    actor_optimizer_original = torch.optim.Adam(actor_original.parameters(), config.policy_lr)
 
     # cql_kwargs = {
     #     "critic_1": cql_critic_1,
@@ -2484,6 +2611,8 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         # "critic": critic,
         "actor": actor,
         "actor_optimizer": actor_optimizer,
+        "actor_original": actor_original,
+        "actor_optimizer_original": actor_optimizer_original,
         "discount": config.discount,
         "soft_target_update_rate": config.soft_target_update_rate,
         "device": config.device,
@@ -2550,34 +2679,34 @@ def train(config: TrainConfig, cw_config: dict = None) -> None:
         trainer.progress_bar.update(1)
         wandb.log(log_dict, step=trainer.total_it)
         # Evaluate episode
-        if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
-            eval_scores = eval_actor(
-                env,
-                actor,
-                device=config.device,
-                n_episodes=config.n_episodes,
-                seed=config.seed,
-            )
-            eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-            print("min score:", env.ref_min_score)
-            evaluations.append(normalized_eval_score)
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
-            )
-            print("---------------------------------------")
-            if config.checkpoints_path:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
-                )
-            wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
-                step=trainer.total_it,
-            )
+        # if (t + 1) % config.eval_freq == 0:
+        #     print(f"Time steps: {t + 1}")
+        #     eval_scores = eval_actor(
+        #         env,
+        #         actor,
+        #         device=config.device,
+        #         n_episodes=config.n_episodes,
+        #         seed=config.seed,
+        #     )
+        #     eval_score = eval_scores.mean()
+        #     normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+        #     print("min score:", env.ref_min_score)
+        #     evaluations.append(normalized_eval_score)
+        #     print("---------------------------------------")
+        #     print(
+        #         f"Evaluation over {config.n_episodes} episodes: "
+        #         f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+        #     )
+        #     print("---------------------------------------")
+        #     if config.checkpoints_path:
+        #         torch.save(
+        #             trainer.state_dict(),
+        #             os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
+        #         )
+        #     wandb.log(
+        #         {"d4rl_normalized_score": normalized_eval_score},
+        #         step=trainer.total_it,
+        #     )
 
 
 def convert_batch_dict_to_list(batch: dict) -> List[torch.Tensor]:
