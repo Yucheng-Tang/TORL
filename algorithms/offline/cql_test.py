@@ -517,7 +517,7 @@ class ContinuousCQL:
         self.return_type = return_type  # Type of return computation
         # segment_n_step_return_qf
         # segment_n_step_return_implicit_vf
-        self.num_samples_in_targets = 10  # Number of samples in targets for segment n-step return
+        self.num_samples_in_targets = 1  # Number of samples in targets for segment n-step return
         self.num_samples_in_policy = 1
         self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
 
@@ -967,7 +967,8 @@ class ContinuousCQL:
         if self.norm_data:
             n_actions = self.replay_buffer.normalize_data("step_actions", n_actions)
 
-        n_actions = n_actions.unsqueeze(-2)  # [num_traj, num_segments, (num_smps), 1, dim_action]
+        if self.num_samples_in_targets != 1:
+            n_actions = n_actions.unsqueeze(-2)  # [num_traj, num_segments, (num_smps), 1, dim_action]
 
         ##################### Compute the Q(s', a') based on the sampled actions ######################
         # [num_traj, num_segments, 1 + num_seg_actions]
@@ -1151,8 +1152,13 @@ class ContinuousCQL:
         n_step_returns = (tril_discount_rewards.sum(
             dim=-1) + seg_discount_q) / discount_start
 
+
+        # TODO: seq case not covered
         if self.backup_entropy:
-            n_step_returns[...,1] = n_step_returns[...,1] - alpha * n_action_log_pi.mean(dim=-1)
+            correction = alpha.detach() * n_action_log_pi.mean(dim=-1)
+            # n_step_returns_final = n_step_returns.clone()
+            # n_step_returns_final[...,1] = n_step_returns[...,1] - correction
+            n_step_returns[..., 1] = n_step_returns[..., 1] - correction
 
         ####################################################################
         # print("n_step_returns", n_step_returns[0, 0, 1], "Q:", min_q1_q2[0, 0, 1], "R:", rewards[0])
