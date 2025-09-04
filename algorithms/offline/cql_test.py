@@ -30,7 +30,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda:1"
+    device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -43,7 +43,7 @@ class TrainConfig:
     discount: float = 0.99  # Discount factor
     alpha_multiplier: float = 1.0  # Multiplier for alpha in loss
     use_automatic_entropy_tuning: bool = True  # Tune entropy
-    backup_entropy: bool = False  # Use backup entropy
+    backup_entropy: bool = True  # Use backup entropy
     policy_lr: float = 3e-5  # Policy learning rate
     qf_lr: float = 3e-4  # Critics learning rate
     soft_target_update_rate: float = 5e-3  # Target network update rate
@@ -926,7 +926,8 @@ class ContinuousCQL:
                                   next_observations: torch.Tensor,
                                   rewards: torch.Tensor,
                                   dones: torch.Tensor,
-                                  idx_in_segments: torch.Tensor, ):
+                                  idx_in_segments: torch.Tensor,
+                                  alpha: torch.Tensor,):
         """
                 Segment-wise n-step return using Q function
                 Use N-step return + Expectation of Q-func as the target of the Q-func prediction
@@ -1149,6 +1150,9 @@ class ContinuousCQL:
         # [num_traj, num_segments, 1 + num_seg_actions]
         n_step_returns = (tril_discount_rewards.sum(
             dim=-1) + seg_discount_q) / discount_start
+
+        if self.backup_entropy:
+            n_step_returns[...,1] = n_step_returns[...,1] - alpha * n_action_log_pi.mean(dim=-1)
 
         ####################################################################
         # print("n_step_returns", n_step_returns[0, 0, 1], "Q:", min_q1_q2[0, 0, 1], "R:", rewards[0])
@@ -1469,7 +1473,9 @@ class ContinuousCQL:
                 next_observations_seq,
                 rewards_seq,
                 dones_seq,
-                idx_in_segments)
+                idx_in_segments,
+                alpha_t
+            )
 
             for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
                 # Use mix precision for faster computation
@@ -1833,34 +1839,34 @@ def train(config: TrainConfig):
         log_dict = trainer.train(batch_seq)
         trainer.progress_bar.update(1)
         wandb.log(log_dict, step=trainer.total_it)
-        # # Evaluate episode
-        # if (t + 1) % config.eval_freq == 0:
-        #     print(f"Time steps: {t + 1}")
-        #     eval_scores = eval_actor(
-        #         env,
-        #         actor,
-        #         device=config.device,
-        #         n_episodes=config.n_episodes,
-        #         seed=config.seed,
-        #     )
-        #     eval_score = eval_scores.mean()
-        #     normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
-        #     evaluations.append(normalized_eval_score)
-        #     print("---------------------------------------")
-        #     print(
-        #         f"Evaluation over {config.n_episodes} episodes: "
-        #         f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
-        #     )
-        #     print("---------------------------------------")
-        #     if config.checkpoints_path:
-        #         torch.save(
-        #             trainer.state_dict(),
-        #             os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
-        #         )
-        #     wandb.log(
-        #         {"d4rl_normalized_score": normalized_eval_score},
-        #         step=trainer.total_it,
-        #     )
+        # Evaluate episode
+        if (t + 1) % config.eval_freq == 0:
+            print(f"Time steps: {t + 1}")
+            eval_scores = eval_actor(
+                env,
+                actor,
+                device=config.device,
+                n_episodes=config.n_episodes,
+                seed=config.seed,
+            )
+            eval_score = eval_scores.mean()
+            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+            evaluations.append(normalized_eval_score)
+            print("---------------------------------------")
+            print(
+                f"Evaluation over {config.n_episodes} episodes: "
+                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+            )
+            print("---------------------------------------")
+            if config.checkpoints_path:
+                torch.save(
+                    trainer.state_dict(),
+                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
+                )
+            wandb.log(
+                {"d4rl_normalized_score": normalized_eval_score},
+                step=trainer.total_it,
+            )
 
 def convert_batch_dict_to_list(batch: dict) -> List[torch.Tensor]:
     return [
