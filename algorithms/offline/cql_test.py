@@ -43,7 +43,7 @@ class TrainConfig:
     discount: float = 0.99  # Discount factor
     alpha_multiplier: float = 1.0  # Multiplier for alpha in loss
     use_automatic_entropy_tuning: bool = True  # Tune entropy
-    backup_entropy: bool = True  # Use backup entropy
+    backup_entropy: bool = False  # Use backup entropy
     policy_lr: float = 3e-5  # Policy learning rate
     qf_lr: float = 3e-4  # Critics learning rate
     soft_target_update_rate: float = 5e-3  # Target network update rate
@@ -70,10 +70,10 @@ class TrainConfig:
     name: str = "CQL"  # wandb run name
 
     # TCQL
-    num_segments: Union[int, str] = 1  # Number of segments (from segments_config) or "random"
+    num_segments: Union[int, str] = 10  # Number of segments (from segments_config) or "random"
     clip_grad_norm: float = 0.0  # Gradient clipping norm
     use_mix_precision: bool = False  # Use mixed precision training
-    sequence_length: int = 1
+    sequence_length: int = 40
     return_type: str = "segment_n_step_return_qf"  # Type of return computation
     lr_critic: float = 3e-4
     random_target: bool = False
@@ -819,8 +819,7 @@ class ContinuousCQL:
             alpha_prime_loss = observations.new_tensor(0.0)
             alpha_prime = observations.new_tensor(0.0)
 
-        qf_loss = qf1_loss + qf2_loss
-                   # + cql_min_qf1_loss + cql_min_qf2_loss
+        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
         # print("QF Loss:", qf1_loss.item(), qf2_loss.item(), cql_min_qf1_loss.item(),
         #       cql_min_qf2_loss.item())
 
@@ -1517,18 +1516,18 @@ class ContinuousCQL:
 
                     # print("critic_loss", critic_loss.item())
 
-                    # cql_loss, alpha_prime, alpha_prime_loss = self.cql_critic_loss(net=net,
-                    #                                                                c_state=c_state,
-                    #                                                                c_state_seq=c_state_seq,
-                    #                                                                n_state_seq=n_state_seq,
-                    #                                                                seg_actions=seg_actions,
-                    #                                                                seg_start_idx=seg_start_idx,
-                    #                                                                seg_actions_idx=seg_actions_idx,
-                    #                                                                seg_state_idx=seg_state_idx,
-                    #                                                                traj_length=traj_length,
-                    #                                                                targets=targets,
-                    #                                                                vq_predict=vq_pred,
-                    #                                                                )
+                    cql_loss, alpha_prime, alpha_prime_loss = self.cql_critic_loss(net=net,
+                                                                                   c_state=c_state,
+                                                                                   c_state_seq=c_state_seq,
+                                                                                   n_state_seq=n_state_seq,
+                                                                                   seg_actions=seg_actions,
+                                                                                   seg_start_idx=seg_start_idx,
+                                                                                   seg_actions_idx=seg_actions_idx,
+                                                                                   seg_state_idx=seg_state_idx,
+                                                                                   traj_length=traj_length,
+                                                                                   targets=targets,
+                                                                                   vq_predict=vq_pred,
+                                                                                   )
 
                     # # SAC test
                     # cql_loss = cql_loss.new_zeros(cql_loss.shape)
@@ -1545,12 +1544,12 @@ class ContinuousCQL:
                             f"{net_name}_target_mean": targets[..., 1:].mean().item(),
                             f"{net_name}_v": vq_pred[..., 0].mean().item(),
                             f"{net_name}_q_loss": critic_loss.item(),
-                            # f"{net_name}_cql_loss":cql_loss.item(),
+                            f"{net_name}_cql_loss":cql_loss.item(),
                         }
                     )
 
                     # total loss for this critic
-                    critic_loss = critic_loss  # + cql_loss
+                    critic_loss = critic_loss + cql_loss
 
                 # # Update critic net parameters
                 # opt.zero_grad(set_to_none=True)
@@ -1850,7 +1849,7 @@ def train(config: TrainConfig):
             print(f"Time steps: {t + 1}")
             eval_scores = eval_actor(
                 env,
-                actor,
+                actor_t,
                 device=config.device,
                 n_episodes=config.n_episodes,
                 seed=config.seed,
