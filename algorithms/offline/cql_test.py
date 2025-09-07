@@ -30,7 +30,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda"
+    device: str = "cuda:1"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -519,7 +519,7 @@ class ContinuousCQL:
         # segment_n_step_return_implicit_vf
         self.num_samples_in_targets = 1  # Number of samples in targets for segment n-step return
         self.num_samples_in_policy = 1
-        self.num_samples_in_cql_loss = 10  # Number of samples in CQL loss
+        self.num_samples_in_cql_loss = 5  # Number of samples in CQL loss
 
         self.random_target = random_target  # Use random target for segment n-step return
         self.discount_factor = torch.tensor(self.discount,
@@ -835,14 +835,16 @@ class ContinuousCQL:
             )
         )
 
-        # log_dict.update(
-        #     dict(
+        log_dict.update(
+            dict(
         #         cql_std_q1=cql_std_q1.mean().item(),
         #         cql_std_q2=cql_std_q2.mean().item(),
         #         cql_q1_rand=cql_q1_rand.mean().item(),
         #         cql_q2_rand=cql_q2_rand.mean().item(),
-        #         cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
-        #         cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+                cql_min_qf1_loss=cql_min_qf1_loss.mean().item(),
+                cql_min_qf2_loss=cql_min_qf2_loss.mean().item(),
+                cql_qf1_ood=cql_qf1_ood.mean().item(),
+                cql_qf2_ood=cql_qf2_ood.mean().item(),
         #         cql_qf1_diff=cql_qf1_diff.mean().item(),
         #         cql_qf2_diff=cql_qf2_diff.mean().item(),
         #         cql_q1_current_actions=cql_q1_current_actions.mean().item(),
@@ -851,8 +853,8 @@ class ContinuousCQL:
         #         cql_q2_next_actions=cql_q2_next_actions.mean().item(),
         #         alpha_prime_loss=alpha_prime_loss.item(),
         #         alpha_prime=alpha_prime.item(),
-        #     )
-        # )
+            )
+        )
 
         return qf_loss, alpha_prime, alpha_prime_loss
 
@@ -1325,7 +1327,7 @@ class ContinuousCQL:
 
         # print("cql_loss", cql_loss.item())
 
-        return cql_loss, alpha_prime, alpha_prime_loss
+        return cql_loss, alpha_prime, alpha_prime_loss, cql_ood
 
     def train(self, batch: TensorBatch) -> Dict[str, float]:
         # (
@@ -1516,7 +1518,7 @@ class ContinuousCQL:
 
                     # print("critic_loss", critic_loss.item())
 
-                    cql_loss, alpha_prime, alpha_prime_loss = self.cql_critic_loss(net=net,
+                    cql_loss, alpha_prime, alpha_prime_loss, cql_ood = self.cql_critic_loss(net=net,
                                                                                    c_state=c_state,
                                                                                    c_state_seq=c_state_seq,
                                                                                    n_state_seq=n_state_seq,
@@ -1545,6 +1547,7 @@ class ContinuousCQL:
                             f"{net_name}_v": vq_pred[..., 0].mean().item(),
                             f"{net_name}_q_loss": critic_loss.item(),
                             f"{net_name}_cql_loss":cql_loss.item(),
+                            f"{net_name}_cql_ood":cql_ood.mean().item(),
                         }
                     )
 
