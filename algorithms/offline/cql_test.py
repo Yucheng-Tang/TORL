@@ -30,7 +30,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda:1"
+    device: str = "cuda:2"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -77,6 +77,7 @@ class TrainConfig:
     return_type: str = "segment_n_step_return_qf"  # Type of return computation
     lr_critic: float = 3e-4
     random_target: bool = False
+    single_step_cql: bool = True
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -487,6 +488,7 @@ class ContinuousCQL:
         dtype: torch.dtype = torch.float32,
         max_timesteps: int = 1e6,
         use_mix_precision: bool = False,
+        single_step_cql: bool = False,
     ):
         super().__init__()
 
@@ -559,6 +561,8 @@ class ContinuousCQL:
         self.num_segments = num_segments
         self.use_mix_precision = use_mix_precision  # Use mixed precision training
         self.clip_grad_norm = clip_grad_norm  # Gradient clipping norm
+
+        self.single_step_cql = single_step_cql
 
 
         # Original CQL
@@ -1204,19 +1208,34 @@ class ContinuousCQL:
         device = seg_actions.device
         dtype = seg_actions.dtype
 
-        # generate random actions along the segments
-        # [num_batch, num_segments, num_smps, num_seg_actions, dim_action]
-        a_rand = torch.empty((B, S, self.num_samples_in_cql_loss, L, d_a), dtype=dtype, device=device).uniform_(act_low, act_high)
-        range_len = act_high - act_low
-        random_density = torch.log((1.0/range_len)**d_a * torch.ones((B, S, self.num_samples_in_cql_loss, L), device=device))
 
-        # # generate t and t+1 step-based actions using current states and next states
-        # # [num_batch, num_segments, num_smps, num_seg_actions, dim_action]
-        # a_step_c, log_pi_c = self.actor.sample(c_state_seq, self.num_samples_in_cql_loss)
-        # a_step_n, log_pi_n = self.actor.sample(n_state_seq, self.num_samples_in_cql_loss)
 
-        a_step_c, log_pi_c = self.actor(c_state_seq, repeat=self.num_samples_in_cql_loss)
-        a_step_n, log_pi_n = self.actor(n_state_seq, repeat=self.num_samples_in_cql_loss)
+        if self.single_step_cql:
+            a_rand = torch.empty((B, S, self.num_samples_in_cql_loss, 1, d_a), dtype=dtype, device=device).uniform_(
+                act_low, act_high)
+            range_len = act_high - act_low
+            random_density = torch.log(
+                (1.0 / range_len) ** d_a * torch.ones((B, S, self.num_samples_in_cql_loss, 1), device=device))
+
+            a_step_c, log_pi_c = self.actor(c_state_seq[:,:,:1,:], num_samples=self.num_samples_in_cql_loss)
+            a_step_n, log_pi_n = self.actor(n_state_seq[:,:,:1,:], num_samples=self.num_samples_in_cql_loss)
+        else:
+            # generate random actions along the segments
+            # [num_batch, num_segments, num_smps, num_seg_actions, dim_action]
+            a_rand = torch.empty((B, S, self.num_samples_in_cql_loss, L, d_a), dtype=dtype, device=device).uniform_(
+                act_low, act_high)
+            range_len = act_high - act_low
+            random_density = torch.log(
+                (1.0 / range_len) ** d_a * torch.ones((B, S, self.num_samples_in_cql_loss, L), device=device))
+
+            # # TODO: modify when activate modular policy
+            # # generate t and t+1 step-based actions using current states and next states
+            # # [num_batch, num_segments, num_smps, num_seg_actions, dim_action]
+            # a_step_c, log_pi_c = self.actor.sample(c_state_seq, self.num_samples_in_cql_loss)
+            # a_step_n, log_pi_n = self.actor.sample(n_state_seq, self.num_samples_in_cql_loss)
+
+            a_step_c, log_pi_c = self.actor(c_state_seq, num_samples=self.num_samples_in_cql_loss)
+            a_step_n, log_pi_n = self.actor(n_state_seq, num_samples=self.num_samples_in_cql_loss)
 
         # a_step_c, log_pi_c = self.actor(c_state_seq)
         # a_step_n, log_pi_n = self.actor(n_state_seq)
@@ -1244,20 +1263,22 @@ class ContinuousCQL:
             a_idx = util.add_expand_dim(seg_actions_idx,
                                         [2],
                                         [num_smp])
+            if self.single_step_cql:
+                a_idx = a_idx[..., :1]
 
 
         cql_rand = self.critic.critic(
             net=net, d_state=None, c_state=c_state,
             actions=a_rand, idx_d=None, idx_c=c_idx,
             idx_a=a_idx)
-        # cql_current_actions = self.critic.critic(
-        #     net=net, d_state=None, c_state=c_state,
-        #     actions=a_step_c, idx_d=None, idx_c=c_idx,
-        #     idx_a=a_idx)
-        # cql_next_actions = self.critic.critic(
-        #     net=net, d_state=None, c_state=c_state,
-        #     actions=a_step_n, idx_d=None, idx_c=c_idx,
-        #     idx_a=a_idx)
+        cql_current_actions = self.critic.critic(
+            net=net, d_state=None, c_state=c_state,
+            actions=a_step_c, idx_d=None, idx_c=c_idx,
+            idx_a=a_idx)
+        cql_next_actions = self.critic.critic(
+            net=net, d_state=None, c_state=c_state,
+            actions=a_step_n, idx_d=None, idx_c=c_idx,
+            idx_a=a_idx)
 
         # TODO: cat dim incorrect, implement top-k sampling first
         # [num_batch, num_segments, segment_length] -> [num_batch, num_segments, segment_length, 1 + 3*K_samples]
@@ -1266,21 +1287,32 @@ class ContinuousCQL:
                 [
                     cql_rand[..., 1:].unsqueeze(-2),
                     vq_predict[..., 1:].unsqueeze(-2),
-                    # cql_next_actions[..., 1:].unsqueeze(-2),
-                    # cql_current_actions[..., 1:].unsqueeze(-2),
+                    cql_next_actions[..., 1:].unsqueeze(-2),
+                    cql_current_actions[..., 1:].unsqueeze(-2),
                 ],
                 dim=-2,
             )
         else:
-            cql_cat = torch.cat(
-                [
-                    cql_rand[..., 1:],
-                    vq_predict[..., 1:].unsqueeze(-2),
-                    # cql_next_actions[..., 1:],
-                    # cql_current_actions[..., 1:],
-                ],
-                dim=-2,
-            )
+            if self.single_step_cql:
+                cql_cat = torch.cat(
+                    [
+                        cql_rand[..., 1:],
+                        vq_predict[..., 1:2].unsqueeze(-2),
+                        cql_next_actions[..., 1:],
+                        cql_current_actions[..., 1:],
+                    ],
+                    dim=-2,
+                )
+            else:
+                cql_cat = torch.cat(
+                    [
+                        cql_rand[..., 1:],
+                        vq_predict[..., 1:].unsqueeze(-2),
+                        cql_next_actions[..., 1:],
+                        cql_current_actions[..., 1:],
+                    ],
+                    dim=-2,
+                )
         # TODO: should vq_predict be included here?
         cql_std = torch.std(cql_cat, dim=-2)
 
@@ -1289,8 +1321,8 @@ class ContinuousCQL:
             cql_cat = torch.cat(
                 [
                     cql_rand[..., 1:] - random_density,
-                    # cql_next_actions[..., 1:] - log_pi_n.detach(),
-                    # cql_current_actions[..., 1:] - log_pi_c.detach(),
+                    cql_next_actions[..., 1:] - log_pi_n.detach(),
+                    cql_current_actions[..., 1:] - log_pi_c.detach(),
                 ],
                 dim=-2,
             )
@@ -1819,6 +1851,7 @@ def train(config: TrainConfig):
         "random_target": config.random_target,
         "max_timesteps": config.max_timesteps,
         "use_mix_precision": config.use_mix_precision,
+        "single_step_cql": config.single_step_cql,
     }
 
     print("---------------------------------------")
