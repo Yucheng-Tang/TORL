@@ -77,7 +77,11 @@ class TrainConfig:
     return_type: str = "segment_n_step_return_qf"  # Type of return computation
     lr_critic: float = 3e-4
     random_target: bool = False
-    single_step_cql: bool = True
+    single_step_cql: bool = False
+
+    num_samples_in_targets: int = 1  # Number of samples in targets for segment n-step return
+    num_samples_in_policy: int = 1
+    num_samples_in_cql_loss: int = 5  # Number of samples in CQL loss
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
@@ -489,6 +493,9 @@ class ContinuousCQL:
         max_timesteps: int = 1e6,
         use_mix_precision: bool = False,
         single_step_cql: bool = False,
+        num_samples_in_targets: int = 1,
+        num_samples_in_policy: int = 1,
+        num_samples_in_cql_loss: int = 5,
     ):
         super().__init__()
 
@@ -519,9 +526,9 @@ class ContinuousCQL:
         self.return_type = return_type  # Type of return computation
         # segment_n_step_return_qf
         # segment_n_step_return_implicit_vf
-        self.num_samples_in_targets = 1  # Number of samples in targets for segment n-step return
-        self.num_samples_in_policy = 1
-        self.num_samples_in_cql_loss = 5  # Number of samples in CQL loss
+        self.num_samples_in_targets = num_samples_in_targets  # Number of samples in targets for segment n-step return
+        self.num_samples_in_policy = num_samples_in_policy
+        self.num_samples_in_cql_loss = num_samples_in_cql_loss  # Number of samples in CQL loss
 
         self.random_target = random_target  # Use random target for segment n-step return
         self.discount_factor = torch.tensor(self.discount,
@@ -1639,6 +1646,22 @@ class ContinuousCQL:
             self.critic.update_target_net(self.critic.net1, self.critic.target_net1)
             self.critic.update_target_net(self.critic.net2, self.critic.target_net2)
 
+            # --- gradient norms ---
+            log_dict["grad_norm/actor_original"] = self.get_grad_norm(self.actor.parameters())
+            log_dict["grad_norm/actor_t"] = self.get_grad_norm(self.actor_t.parameters())
+            log_dict["grad_norm/critic1_original"] = self.get_grad_norm(self.critic_1.parameters())
+            log_dict["grad_norm/critic2_original"] = self.get_grad_norm(self.critic_2.parameters())
+            log_dict["grad_norm/critic_t_net1"] = self.get_grad_norm(self.critic.net1.parameters())
+            log_dict["grad_norm/critic_t_net2"] = self.get_grad_norm(self.critic.net2.parameters())
+
+            # --- parameter norms ---
+            log_dict["param_norm/actor_original"] = self.get_param_norm(self.actor.parameters())
+            log_dict["param_norm/actor_t"] = self.get_param_norm(self.actor_t.parameters())
+            log_dict["param_norm/critic1_original"] = self.get_param_norm(self.critic_1.parameters())
+            log_dict["param_norm/critic2_original"] = self.get_param_norm(self.critic_2.parameters())
+            log_dict["param_norm/critic_t_net1"] = self.get_param_norm(self.critic.net1.parameters())
+            log_dict["param_norm/critic_t_net2"] = self.get_param_norm(self.critic.net2.parameters())
+
 
         return log_dict
 
@@ -1685,6 +1708,34 @@ class ContinuousCQL:
             state_dict=state_dict["cql_log_alpha_optim"]
         )
         self.total_it = state_dict["total_it"]
+
+    @staticmethod
+    def get_grad_norm(parameters, norm_type=2.0):
+        parameters = [p for p in parameters if p.grad is not None]
+        if len(parameters) == 0:
+            return 0.0
+        device = parameters[0].grad.device
+        total_norm = torch.norm(
+            torch.stack([
+                torch.norm(p.grad.detach(), norm_type).to(device)
+                for p in parameters
+            ]), norm_type
+        )
+        return total_norm.item()
+
+    @staticmethod
+    def get_param_norm(parameters, norm_type=2.0):
+        parameters = [p for p in parameters if p is not None]
+        if len(parameters) == 0:
+            return 0.0
+        device = parameters[0].device
+        total_norm = torch.norm(
+            torch.stack([
+                torch.norm(p.detach(), norm_type).to(device)
+                for p in parameters
+            ]), norm_type
+        )
+        return total_norm.item()
 
 
 @pyrallis.wrap()
@@ -1852,6 +1903,9 @@ def train(config: TrainConfig):
         "max_timesteps": config.max_timesteps,
         "use_mix_precision": config.use_mix_precision,
         "single_step_cql": config.single_step_cql,
+        "num_samples_in_targets": config.num_samples_in_targets,
+        "num_samples_in_policy":config.num_samples_in_policy,
+        "num_samples_in_policy":config.num_samples_in_cql_loss,
     }
 
     print("---------------------------------------")
