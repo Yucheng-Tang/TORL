@@ -30,7 +30,7 @@ TensorBatch = List[torch.Tensor]
 
 @dataclass
 class TrainConfig:
-    device: str = "cuda:2"
+    device: str = "cuda"
     env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e2)  # How often (time steps) we evaluate
@@ -1905,7 +1905,7 @@ def train(config: TrainConfig):
         "single_step_cql": config.single_step_cql,
         "num_samples_in_targets": config.num_samples_in_targets,
         "num_samples_in_policy":config.num_samples_in_policy,
-        "num_samples_in_policy":config.num_samples_in_cql_loss,
+        "num_samples_in_cql_loss":config.num_samples_in_cql_loss,
     }
 
     print("---------------------------------------")
@@ -1959,7 +1959,7 @@ def train(config: TrainConfig):
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
             wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
+                {"score/d4rl_normalized_score": normalized_eval_score},
                 step=trainer.total_it,
             )
 
