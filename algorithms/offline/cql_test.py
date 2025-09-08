@@ -830,7 +830,8 @@ class ContinuousCQL:
             alpha_prime_loss = observations.new_tensor(0.0)
             alpha_prime = observations.new_tensor(0.0)
 
-        qf_loss = qf1_loss + qf2_loss + cql_min_qf1_loss + cql_min_qf2_loss
+        qf_loss = qf1_loss + qf2_loss
+                   # + cql_min_qf1_loss + cql_min_qf2_loss)
         # print("QF Loss:", qf1_loss.item(), qf2_loss.item(), cql_min_qf1_loss.item(),
         #       cql_min_qf2_loss.item())
 
@@ -1525,7 +1526,7 @@ class ContinuousCQL:
 
             for net_name, net, target_net, opt, scaler in self.critic_nets_and_opt():
                 # Use mix precision for faster computation
-                with (util.autocast_if(self.use_mix_precision)):
+                with ((util.autocast_if(self.use_mix_precision))):
                     # [num_traj, num_segments, 1 + num_seg_actions]
                     vq_pred = self.critic.critic(
                         net=net, d_state=None, c_state=c_state,
@@ -1557,18 +1558,18 @@ class ContinuousCQL:
 
                     # print("critic_loss", critic_loss.item())
 
-                    cql_loss, alpha_prime, alpha_prime_loss, cql_ood = self.cql_critic_loss(net=net,
-                                                                                   c_state=c_state,
-                                                                                   c_state_seq=c_state_seq,
-                                                                                   n_state_seq=n_state_seq,
-                                                                                   seg_actions=seg_actions,
-                                                                                   seg_start_idx=seg_start_idx,
-                                                                                   seg_actions_idx=seg_actions_idx,
-                                                                                   seg_state_idx=seg_state_idx,
-                                                                                   traj_length=traj_length,
-                                                                                   targets=targets,
-                                                                                   vq_predict=vq_pred,
-                                                                                   )
+                    # cql_loss, alpha_prime, alpha_prime_loss, cql_ood = self.cql_critic_loss(net=net,
+                    #                                                                c_state=c_state,
+                    #                                                                c_state_seq=c_state_seq,
+                    #                                                                n_state_seq=n_state_seq,
+                    #                                                                seg_actions=seg_actions,
+                    #                                                                seg_start_idx=seg_start_idx,
+                    #                                                                seg_actions_idx=seg_actions_idx,
+                    #                                                                seg_state_idx=seg_state_idx,
+                    #                                                                traj_length=traj_length,
+                    #                                                                targets=targets,
+                    #                                                                vq_predict=vq_pred,
+                    #                                                                )
 
                     # # SAC test
                     # cql_loss = cql_loss.new_zeros(cql_loss.shape)
@@ -1585,13 +1586,14 @@ class ContinuousCQL:
                             f"{net_name}_target_mean": targets[..., 1:].mean().item(),
                             f"{net_name}_v": vq_pred[..., 0].mean().item(),
                             f"{net_name}_q_loss": critic_loss.item(),
-                            f"{net_name}_cql_loss":cql_loss.item(),
-                            f"{net_name}_cql_ood":cql_ood.mean().item(),
+                            # f"{net_name}_cql_loss":cql_loss.item(),
+                            # f"{net_name}_cql_ood":cql_ood.mean().item(),
                         }
                     )
 
                     # total loss for this critic
-                    critic_loss = critic_loss + cql_loss
+                    critic_loss = critic_loss
+                    # + cql_loss
 
                 # # Update critic net parameters
                 # opt.zero_grad(set_to_none=True)
